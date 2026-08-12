@@ -24,21 +24,105 @@ class Command:
         return {}
 
 class MoveTokensCommand(Command):
-    def __init__(self, app, label_moves):
+    """A move, together with any ghosts the move left behind.
+
+    Ghosts are dropped at the moment a drag begins, outside the command system, so
+    undoing the move used to slide the player back and leave its ghost stranded where
+    nothing had happened. Carrying them here makes one undo take back the whole
+    gesture, and redo put it back."""
+
+    def __init__(self, app, label_moves, ghosts=None, record_step=True):
         self.app = app
         self.label_moves = label_moves
+        self.ghosts = list(ghosts or [])
+        # Composed commands (a tactic, for instance) log themselves and would otherwise
+        # write a second, duplicate line.
+        self.record_step = record_step
+        self.step_desc = self._describe()
+        self.animation_steps = []
+
+    def _describe(self):
+        labels = sorted(self.label_moves)
+        if not labels:
+            return "Move"
+        shown = ", ".join(labels[:3]) + (f" +{len(labels) - 3}" if len(labels) > 3 else "")
+        dx, dy = next(iter(self.label_moves.values()))
+        return f"Move {shown} ({int(dx):+d},{int(dy):+d})"
+
+    def record(self):
+        """Called once when the move is pushed: put it in the timeline and make it a
+        keyframe, so a sequence of drags builds an animation as it goes."""
+        if not self.record_step or not self.label_moves:
+            return
+        self.app.action_steps.append(self.step_desc)
+        try:
+            self.app.steps_listbox.insert(tk.END, self.step_desc)
+        except Exception:
+            pass
+        self.animation_steps = self.app._record_move_as_animation_step(
+            self.label_moves, name=self.step_desc)
+
+    def _forget(self):
+        if self.step_desc in self.app.action_steps:
+            index = self.app.action_steps.index(self.step_desc)
+            self.app.action_steps.pop(index)
+            try:
+                self.app.steps_listbox.delete(index)
+            except Exception:
+                pass
+        for step in self.animation_steps:
+            if step in self.app.animation_steps:
+                self.app.animation_steps.remove(step)
+        if self.animation_steps:
+            self.app._renumber_animation_steps()
+            self.app.animation_playhead = max(0, len(self.app.animation_steps) - 1)
+            self.app._refresh_animation_list()
+
+    def _remember(self):
+        if not self.record_step:
+            return
+        self.app.action_steps.append(self.step_desc)
+        try:
+            self.app.steps_listbox.insert(tk.END, self.step_desc)
+        except Exception:
+            pass
+        for step in self.animation_steps:
+            if step not in self.app.animation_steps:
+                self.app.animation_steps.append(step)
+        if self.animation_steps:
+            self.app._renumber_animation_steps()
+            self.app._refresh_animation_list()
 
     def execute(self):
         for label, (dx, dy) in self.label_moves.items():
             sid = self.app._get_sid_by_label(label)
             if sid:
                 self._move(sid, dx, dy)
+        self._restore_ghosts()
+        self._remember()
 
     def undo(self):
+        self._remove_ghosts()
         for label, (dx, dy) in self.label_moves.items():
             sid = self.app._get_sid_by_label(label)
             if sid:
                 self._move(sid, -dx, -dy)
+        self._forget()
+
+    def _remove_ghosts(self):
+        for spec in self.ghosts:
+            for token in list(self.app.tokens.values()):
+                if token.get("is_ghost") and token.get("label") == spec.get("label"):
+                    self.app._delete_token(token)
+                    break
+
+    def _restore_ghosts(self):
+        """Redo: put back exactly the ghosts this move produced."""
+        for spec in self.ghosts:
+            if any(t.get("is_ghost") and t.get("label") == spec.get("label")
+                   for t in self.app.tokens.values()):
+                continue
+            self.app._spawn_ghost(spec)
 
     def _move(self, sid, dx, dy):
         token = self.app.tokens.get(sid)
@@ -81,9 +165,12 @@ class ApplyTacticCommand(Command):
         self.label_moves = label_moves          # internal label -> (dx, dy)
         self.positions = positions              # internal label -> role, e.g. "LD"
         self.previous_positions = {}
+        self.animation_steps = []
         # Composed rather than subclassed so the movement keeps following attached
         # tactic lines exactly as a hand-drag would.
-        self.move = MoveTokensCommand(app, label_moves)
+        # record_step=False: this command writes its own, richer timeline line and
+        # keyframe; the inner move must not add a second one.
+        self.move = MoveTokensCommand(app, label_moves, record_step=False)
         roles = ", ".join(positions[label] for label in sorted(positions))
         side = "Attack" if team == "att" else "Defence"
         self.step_desc = f"{side} {formation} {int(percent)}% [{roles}]"
@@ -105,6 +192,19 @@ class ApplyTacticCommand(Command):
             self.app.steps_listbox.insert(tk.END, self.step_desc)
         except Exception:
             pass
+        # On redo, put the keyframe back where it was.
+        for step in self.animation_steps:
+            if step not in self.app.animation_steps:
+                self.app.animation_steps.append(step)
+        if self.animation_steps:
+            self.app._renumber_animation_steps()
+            self.app._refresh_animation_list()
+
+    def record(self):
+        """A formation change is a move of the whole team, so it becomes a keyframe
+        like any other -- the timeline line itself is written in execute()."""
+        self.animation_steps = self.app._record_move_as_animation_step(
+            self.label_moves, name=self.step_desc)
 
     def undo(self):
         self.move.undo()
@@ -117,6 +217,13 @@ class ApplyTacticCommand(Command):
                 self.app.steps_listbox.delete(index)
             except Exception:
                 pass
+        for step in self.animation_steps:
+            if step in self.app.animation_steps:
+                self.app.animation_steps.remove(step)
+        if self.animation_steps:
+            self.app._renumber_animation_steps()
+            self.app.animation_playhead = max(0, len(self.app.animation_steps) - 1)
+            self.app._refresh_animation_list()
 
     def serialize(self):
         return {
@@ -473,6 +580,9 @@ class FloorballTacticsApp:
     # A second, thinner ring drawn outside the white one, so the white edge itself has
     # a border and a light-coloured player does not dissolve into the rink.
     TOKEN_EDGE = "#000000"
+    # The curve handle on a selected bend, kept distinct from the blue handles that
+    # move or stretch a line.
+    BEND_HANDLE_COLOR = "#f76707"
 
     # Every widget asked for "Segoe UI", which only exists on Windows. Elsewhere Tk
     # silently falls back to the "fixed" bitmap font, which is why the whole UI
@@ -493,11 +603,13 @@ class FloorballTacticsApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Floorball Tactics Studio")
-        self.root.geometry("1300x850")
+        self.root.geometry("1500x900")
         # The toolbar is pinned to two rows, so it cannot shed a row to cope with a
         # narrow window: below this width Tactics gets squeezed to a sliver and then
-        # drops out entirely. Refuse the sizes that would break it.
-        self.root.minsize(1240, 700)
+        # drops out entirely. Refuse the sizes that would break it. The floor rose from
+        # 1240 when the Timeline box gained the animation list and its transport
+        # buttons -- that width has to come from somewhere.
+        self.root.minsize(1400, 700)
         self.root.configure(bg="#f8f9fa")
         self.UI_FONT = self._pick_ui_font()
 
@@ -516,6 +628,21 @@ class FloorballTacticsApp:
         self.drawn_items = {}   # canvas_id -> metadata for signs/lines
         self.watermark = None   # {path, image, mx, my, w_m, h_m} in rink metres
         self._watermark_photo = None
+
+        # Animation: a list of keyframes, each a board snapshot in rink metres plus how
+        # long the move *into* it takes. Step 0 is the opening slide.
+        self.animation_steps = []
+        self.animation_playhead = 0
+        self.animation_playing = False
+        self.animation_job = None
+        self.anim_buttons = {}
+        self.step_time_var = tk.DoubleVar(value=2.0)
+
+        # Text labels and pictures placed on the board (the watermark is separate: one
+        # of it, living underneath everything).
+        self.board_images = {}          # canvas id -> {original, photo, w_px, h_px}
+        self.text_size_var = tk.IntVar(value=14)
+        self.color_theme = "Classic (black)"
         self.drawings = []      # list of (line_ids, drawing_data)
         self.action_steps = []  # textual step descriptions
 
@@ -668,6 +795,11 @@ class FloorballTacticsApp:
                 saved_position = cfg.get("menu_position", self.menu_position)
                 self.menu_position = saved_position if saved_position in ("top", "bottom") else "top"
                 self.rink_rotated = cfg.get("rink_rotated", self.rink_rotated)
+                # Only the name is stored: the colours themselves are already saved
+                # individually, and a theme the app no longer ships falls back cleanly.
+                saved_theme = cfg.get("color_theme", self.color_theme)
+                if saved_theme in self.COLOR_THEMES:
+                    self.color_theme = saved_theme
         except Exception:
             pass
 
@@ -693,7 +825,8 @@ class FloorballTacticsApp:
                 "menu_two_rows": self.menu_two_rows,
                 "menu_rows_mode": self.menu_rows_mode,
                 "menu_position": self.menu_position,
-                "rink_rotated": self.rink_rotated
+                "rink_rotated": self.rink_rotated,
+                "color_theme": self.color_theme
             }
             with open(self.config_path, "w") as f:
                 json.dump(cfg, f, indent=2)
@@ -706,6 +839,11 @@ class FloorballTacticsApp:
     def push_command(self, cmd, execute=True):
         if execute:
             cmd.execute()
+        # Commands pushed with execute=False have already happened on the canvas, so
+        # anything they need to log has to be done here rather than in execute().
+        recorder = getattr(cmd, "record", None)
+        if callable(recorder):
+            recorder()
         self.undo_stack.append(cmd)
         self.redo_stack.clear()
         self._save_config()
@@ -771,11 +909,16 @@ class FloorballTacticsApp:
             return False
 
     def _recolor_selected_signs(self):
-        """Apply the current sign colour to any already-placed signs in the selection,
-        so the picker can be used to fix a sign after the fact and not only before."""
-        for cid in list(self.selected_drawn):
+        """Apply the current sign colour to anything already placed in the selection --
+        signs and text labels alike -- so the picker fixes a mark after the fact and not
+        only before."""
+        for cid in self._selected_drawn_ids():
             meta = self.drawn_items.get(cid)
-            if not meta or meta.get("type") != "sign":
+            if not meta or meta.get("type") not in ("sign", "text"):
+                continue
+            if meta.get("decor"):
+                # The holes in the ball are what make it read as a ball; painting them
+                # the sign colour would fill it in solid.
                 continue
             meta["color"] = self.sign_color
             for option in meta.get("color_options") or ("fill",):
@@ -999,6 +1142,636 @@ class FloorballTacticsApp:
                 except Exception:
                     pass
             self._set_token_position(token, entry.get("position"))
+
+    # ----------------------
+    # Text and image objects
+    # ----------------------
+    TEXT_MIN_SIZE = 6
+    TEXT_MAX_SIZE = 96
+    IMAGE_DEFAULT_W_M = 8.0
+    IMAGE_MIN_PX = 12
+
+    def _ask_for_text(self, initial=""):
+        """A small modal in the app's own style, rather than Tk's stock prompt."""
+        window = tk.Toplevel(self.root)
+        window.title("Text")
+        window.transient(self.root)
+        window.configure(bg=self.C_PANEL)
+        tk.Label(window, text="Text to place on the board:", bg=self.C_PANEL,
+                 fg=self.C_TEXT, font=(self.UI_FONT, 9)).pack(padx=14, pady=(12, 6))
+        value = tk.StringVar(value=initial)
+        entry = tk.Entry(window, textvariable=value, font=(self.UI_FONT, 10), width=34,
+                         relief=tk.FLAT, highlightthickness=1,
+                         highlightbackground=self.C_BORDER, bg=self.C_SURFACE)
+        entry.pack(padx=14)
+        entry.focus_set()
+        result = {"text": None}
+
+        def accept(_event=None):
+            result["text"] = value.get().strip()
+            window.destroy()
+
+        buttons = tk.Frame(window, bg=self.C_PANEL)
+        buttons.pack(padx=14, pady=12, fill=tk.X)
+        cfg = {"font": (self.UI_FONT, 8), "relief": tk.FLAT, "bg": self.C_BTN,
+               "fg": self.C_TEXT, "bd": 0, "highlightthickness": 1,
+               "highlightbackground": self.C_BORDER, "padx": 10, "pady": 3,
+               "cursor": "hand2"}
+        tk.Button(buttons, text="Place", command=accept, **cfg).pack(side=tk.RIGHT, padx=3)
+        tk.Button(buttons, text="Cancel", command=window.destroy, **cfg).pack(side=tk.RIGHT)
+        entry.bind("<Return>", accept)
+        window.bind("<Escape>", lambda _e: window.destroy())
+        window.grab_set()
+        self.root.wait_window(window)
+        return result["text"] or None
+
+    def place_text_canvas(self, x, y, text=None, size=None):
+        """Put a text label on the board. It is a drawn item like a sign, so it can be
+        selected, moved, recoloured, rotated with the rest and deleted."""
+        if text is None:
+            text = self._ask_for_text()
+        if not text:
+            return []
+        try:
+            size = int(size if size is not None else self.text_size_var.get())
+        except Exception:
+            size = 14
+        size = max(self.TEXT_MIN_SIZE, min(self.TEXT_MAX_SIZE, size))
+        cid = self.canvas.create_text(x, y, text=text, fill=self.sign_color,
+                                      font=(self.UI_FONT, size, "bold"),
+                                      tags=("sign", "board_text"))
+        self._register_drawn_item(cid, {"type": "text", "sign_type": "text",
+                                        "text": text, "size": size,
+                                        "color": self.sign_color})
+        return [cid]
+
+    def _scale_board_text(self, cid, factor):
+        meta = self.drawn_items.get(cid)
+        if not meta or meta.get("type") != "text" or abs(factor - 1.0) < 1e-9:
+            return
+        size = max(self.TEXT_MIN_SIZE,
+                   min(self.TEXT_MAX_SIZE, int(round(meta.get("size", 14) * factor))))
+        if size == meta.get("size"):
+            return
+        meta["size"] = size
+        try:
+            self.canvas.itemconfig(cid, font=(self.UI_FONT, size, "bold"))
+        except Exception:
+            pass
+
+    def _apply_sign_size(self, _event=None):
+        """The Size field governs both kinds of mark: it restamps the selected signs at
+        the new size and retypes the selected text labels to match, as well as setting
+        the size for whatever is placed next."""
+        try:
+            size = max(6, min(60, int(self.sign_size_var.get())))
+        except Exception:
+            return
+        # Keep the text field in step -- one Size, one look.
+        try:
+            self.text_size_var.set(max(self.TEXT_MIN_SIZE,
+                                       min(self.TEXT_MAX_SIZE, size)))
+        except Exception:
+            pass
+
+        removed, added = set(), set()
+        done_groups = set()
+        for cid in self._selected_drawn_ids():
+            meta = self.drawn_items.get(cid)
+            if not meta:
+                continue
+            if meta.get("type") == "text":
+                meta["size"] = max(self.TEXT_MIN_SIZE, min(self.TEXT_MAX_SIZE, size))
+                try:
+                    self.canvas.itemconfig(cid, font=(self.UI_FONT, meta["size"], "bold"))
+                except Exception:
+                    pass
+                continue
+            if meta.get("type") != "sign":
+                continue
+            group = meta.get("group")
+            if group in done_groups:
+                continue
+            done_groups.add(group)
+            # A sign is drawn at a fixed size, so changing it means stamping a fresh one
+            # in the same place and dropping the old.
+            box = self.canvas.bbox(group) if group else self.canvas.bbox(cid)
+            if not box:
+                continue
+            centre = ((box[0] + box[2]) / 2, (box[1] + box[3]) / 2)
+            sign_type = meta.get("sign_type", "dot")
+            for member in (self.canvas.find_withtag(group) if group else (cid,)):
+                self.canvas.delete(member)
+                self.drawn_items.pop(member, None)
+                removed.add(member)
+            added.update(self.place_sign_canvas(centre[0], centre[1], sign_type,
+                                                size=size))
+
+        if removed or added:
+            # Keep everything else that was selected: restamping the signs must not
+            # drop the text labels out of the selection alongside them.
+            self.selected_drawn = (set(self.selected_drawn) - removed) | added
+            self.highlight_selected()
+
+    def _apply_text_size(self, _event=None):
+        """The size field: retype the selected labels, and set the size for new ones."""
+        try:
+            size = max(self.TEXT_MIN_SIZE,
+                       min(self.TEXT_MAX_SIZE, int(self.text_size_var.get())))
+        except Exception:
+            return
+        for cid in self._selected_drawn_ids():
+            meta = self.drawn_items.get(cid)
+            if not meta or meta.get("type") != "text":
+                continue
+            meta["size"] = size
+            try:
+                self.canvas.itemconfig(cid, font=(self.UI_FONT, size, "bold"))
+            except Exception:
+                pass
+
+    def add_board_image(self):
+        """Load a picture onto the rink. Unlike the watermark -- of which there is one,
+        living under everything -- these are ordinary objects: several at a time, on top
+        of the rink, movable and resizable like anything else."""
+        path = filedialog.askopenfilename(filetypes=self.IMAGE_FILETYPES)
+        if not path:
+            return None
+        try:
+            image = Image.open(path).convert("RGBA")
+        except Exception as error:
+            messagebox.showerror("Error", f"Could not open that image: {error}")
+            return None
+        longest = max(image.width, image.height)
+        if longest > self.WATERMARK_MAX_PX:
+            ratio = self.WATERMARK_MAX_PX / longest
+            image = image.resize((max(1, int(image.width * ratio)),
+                                  max(1, int(image.height * ratio))),
+                                 Image.Resampling.LANCZOS)
+        scale = self._pitch_state().get("scale") or 20
+        width_px = max(self.IMAGE_MIN_PX, int(self.IMAGE_DEFAULT_W_M * scale))
+        height_px = max(self.IMAGE_MIN_PX,
+                        int(width_px * image.height / max(image.width, 1)))
+        cx, cy = self._pitch_center_px()
+        record = {"original": image, "path": path, "w_px": width_px, "h_px": height_px}
+        cid = self._draw_board_image(record, cx, cy)
+        self.clear_selection()
+        self.selected_drawn = {cid}
+        self.highlight_selected()
+        self._draw_selection_overlay()
+        return cid
+
+    def _draw_board_image(self, record, x, y):
+        photo = ImageTk.PhotoImage(
+            record["original"].resize((max(1, int(record["w_px"])),
+                                       max(1, int(record["h_px"]))),
+                                      Image.Resampling.LANCZOS))
+        cid = self.canvas.create_image(x, y, image=photo, tags=("sign", "board_image"))
+        # Tk keeps no reference to a PhotoImage, so it must be held here or the picture
+        # is garbage collected and the item draws as nothing at all.
+        record["photo"] = photo
+        self.board_images[cid] = record
+        self._register_drawn_item(cid, {"type": "image", "sign_type": "image",
+                                        "path": record.get("path")})
+        return cid
+
+    def _scale_board_image(self, cid, scale_x, scale_y):
+        record = self.board_images.get(cid)
+        if not record:
+            return
+        if abs(scale_x - 1.0) < 1e-9 and abs(scale_y - 1.0) < 1e-9:
+            return
+        record["w_px"] = max(self.IMAGE_MIN_PX, record["w_px"] * scale_x)
+        record["h_px"] = max(self.IMAGE_MIN_PX, record["h_px"] * scale_y)
+        coords = self.canvas.coords(cid)
+        photo = ImageTk.PhotoImage(
+            record["original"].resize((max(1, int(record["w_px"])),
+                                       max(1, int(record["h_px"]))),
+                                      Image.Resampling.LANCZOS))
+        record["photo"] = photo
+        try:
+            self.canvas.itemconfig(cid, image=photo)
+            if coords:
+                self.canvas.coords(cid, *coords)
+        except Exception:
+            pass
+
+    def reset_board(self):
+        """Back to a clean board: default formations, nothing drawn, no history.
+
+        It asks first -- there is no undo past a reset, because the history is part of
+        what it clears."""
+        if not messagebox.askyesno(
+                "Reset the board?",
+                "This clears the drawings and signs, the watermark, the timeline and "
+                "the animation steps, and puts both teams back in their starting "
+                "positions.\n\nIt cannot be undone. Continue?"):
+            return
+
+        self.stop_animation()
+        self.animation_steps = []
+        self.animation_playhead = 0
+        self._refresh_animation_list()
+
+        self.cancel_active_tool()
+        self.clear_selection()
+        for cid in list(self.drawn_items):
+            try:
+                self.canvas.delete(cid)
+            except Exception:
+                pass
+        self.drawn_items.clear()
+        self.drawings = []
+        for tag in ("sign", "tactic_line", "ghost", "watermark"):
+            try:
+                self.canvas.delete(tag)
+            except Exception:
+                pass
+
+        self.watermark = None
+        self._watermark_photo = None
+        self.board_images.clear()
+
+        self.undo_stack.clear()
+        self.redo_stack.clear()
+        self.action_steps.clear()
+        try:
+            self.steps_listbox.delete(0, tk.END)
+        except Exception:
+            pass
+        self.clipboard = []
+        self.groups = []
+
+        # _update_roster is the one place that rebuilds both teams from scratch, which
+        # is exactly what is wanted here (and exactly why redraw_canvas must not call
+        # it -- there it would wipe the board on every resize).
+        self._update_roster()
+        self.redraw_canvas()
+        self._update_indicators()
+
+    # ----------------------
+    # Animation
+    # ----------------------
+    # 25 frames a second on screen and in the exported GIF: smooth enough for players
+    # sliding across a rink, cheap enough that a long sequence still exports quickly.
+    ANIMATION_FPS = 25
+    PLAYHEAD_COLOR = "#e03131"
+
+    def add_animation_step(self):
+        """Freeze the board as the next keyframe.
+
+        The very first Add Step records two: the board as it stands becomes step 0, the
+        opening slide, so there is always something to move *from*."""
+        duration = max(0.1, float(self.step_time_var.get()))
+        snapshot = self._board_snapshot()
+        if not self.animation_steps:
+            self.animation_steps.append({"duration": duration, "board": snapshot,
+                                         "name": "Start"})
+            self.animation_playhead = 0
+            self._refresh_animation_list()
+            return
+        self.animation_steps.append({"duration": duration, "board": snapshot,
+                                     "name": f"Step {len(self.animation_steps)}"})
+        self.animation_playhead = len(self.animation_steps) - 1
+        self._refresh_animation_list()
+
+    def delete_animation_step(self):
+        if not self.animation_steps:
+            messagebox.showwarning("No steps", "There are no animation steps to delete.")
+            return
+        index = self.animation_playhead
+        if 0 <= index < len(self.animation_steps):
+            self.animation_steps.pop(index)
+        for position, step in enumerate(self.animation_steps):
+            step["name"] = "Start" if position == 0 else f"Step {position}"
+        self.animation_playhead = max(0, min(self.animation_playhead,
+                                             len(self.animation_steps) - 1))
+        self._refresh_animation_list()
+
+    def _px_delta_to_m(self, dx, dy):
+        """A pixel offset expressed in rink metres, honouring the rink's orientation."""
+        state = self._pitch_state()
+        scale = state.get("scale") or 1.0
+        if state.get("rotated"):
+            return (-dy / scale, dx / scale)
+        return (dx / scale, dy / scale)
+
+    def _record_move_as_animation_step(self, label_moves, name=None):
+        """Turn a completed move into a keyframe, so dragging players around builds the
+        animation as you go.
+
+        When this is the first one, the board *before* the move is recorded as step 0 --
+        the opening slide -- by winding the moved players back along their own deltas.
+        Without it the sequence would begin at the end of the first move, with nothing
+        to travel from."""
+        if not label_moves:
+            return []
+        added = []
+        after = self._board_snapshot()
+        if not self.animation_steps:
+            before = json.loads(json.dumps(after))
+            for player in before.get("players", []):
+                delta = label_moves.get(player.get("label"))
+                if not delta:
+                    continue
+                dmx, dmy = self._px_delta_to_m(delta[0], delta[1])
+                player["mx"] = round(player["mx"] - dmx, 3)
+                player["my"] = round(player["my"] - dmy, 3)
+            start = {"duration": max(0.1, float(self.step_time_var.get())),
+                     "board": before, "name": "Start"}
+            self.animation_steps.append(start)
+            added.append(start)
+        step = {"duration": max(0.1, float(self.step_time_var.get())),
+                "board": after,
+                "name": name or f"Step {len(self.animation_steps)}",
+                "named": bool(name)}
+        self.animation_steps.append(step)
+        added.append(step)
+        self._renumber_animation_steps()
+        self.animation_playhead = len(self.animation_steps) - 1
+        self._refresh_animation_list()
+        return added
+
+    def _renumber_animation_steps(self):
+        """Keep the automatic names in step with the order. A step named after the
+        action that made it ("Move A1", "Attack House 70% ...") keeps that name --
+        renumbering must not throw away what the row actually says."""
+        for position, step in enumerate(self.animation_steps):
+            if step.get("named"):
+                continue
+            step["name"] = "Start" if position == 0 else f"Step {position}"
+
+    def move_animation_step(self, delta):
+        """Move the selected step one place up or down the sequence."""
+        if not self.animation_steps:
+            messagebox.showwarning("No steps", "There are no animation steps to move.")
+            return
+        index = self.animation_playhead
+        target = index + delta
+        if not (0 <= index < len(self.animation_steps)) or \
+                not (0 <= target < len(self.animation_steps)):
+            return
+        steps = self.animation_steps
+        steps[index], steps[target] = steps[target], steps[index]
+        self._renumber_animation_steps()
+        self.animation_playhead = target
+        # The order changed under it, so any playback in flight no longer means
+        # anything -- start again rather than jumping mid-move.
+        self.stop_animation(rewind=False)
+        self._refresh_animation_list()
+
+    def _anim_drag_start(self, event):
+        self._anim_drag_index = self.anim_listbox.nearest(event.y)
+        return None
+
+    def _anim_drag_motion(self, event):
+        """Show where the dragged step would land by moving it as the pointer goes."""
+        source = getattr(self, "_anim_drag_index", None)
+        if source is None or not self.animation_steps:
+            return None
+        target = max(0, min(self.anim_listbox.nearest(event.y),
+                            len(self.animation_steps) - 1))
+        if target == source:
+            return None
+        step = self.animation_steps.pop(source)
+        self.animation_steps.insert(target, step)
+        self._anim_drag_index = target
+        self.animation_playhead = target
+        self._renumber_animation_steps()
+        self._refresh_animation_list()
+        return None
+
+    def _anim_drag_end(self, _event=None):
+        if getattr(self, "_anim_drag_index", None) is not None:
+            self.stop_animation(rewind=False)
+            self._refresh_animation_list()
+        self._anim_drag_index = None
+        return None
+
+    def _refresh_animation_list(self):
+        listbox = getattr(self, "anim_listbox", None)
+        if listbox is None:
+            return
+        listbox.delete(0, tk.END)
+        for index, step in enumerate(self.animation_steps):
+            listbox.insert(tk.END, f"{index}  {step['name']}   {step['duration']:.1f}s")
+        # The playhead is the red row: playback starts there.
+        if 0 <= self.animation_playhead < len(self.animation_steps):
+            listbox.itemconfig(self.animation_playhead,
+                               background=self.PLAYHEAD_COLOR, foreground="#ffffff",
+                               selectbackground=self.PLAYHEAD_COLOR)
+
+    def _on_anim_step_selected(self, _event=None):
+        selection = self.anim_listbox.curselection()
+        if selection:
+            self.animation_playhead = selection[0]
+            self._refresh_animation_list()
+
+    def _on_step_time_changed(self, _value=None):
+        """The slider is the time for all steps: moving it retimes the whole sequence.
+        A single step can still be given its own interval by double-clicking it."""
+        duration = max(0.1, float(self.step_time_var.get()))
+        for step in self.animation_steps:
+            step["duration"] = duration
+        self._refresh_animation_list()
+
+    def _edit_step_time(self, _event=None):
+        if not self.animation_steps:
+            return
+        index = self.animation_playhead
+        if not (0 <= index < len(self.animation_steps)):
+            return
+        window = tk.Toplevel(self.root)
+        window.title("Step time")
+        window.transient(self.root)
+        window.configure(bg=self.C_PANEL)
+        tk.Label(window, text=f"Seconds for {self.animation_steps[index]['name']}:",
+                 bg=self.C_PANEL, fg=self.C_TEXT, font=(self.UI_FONT, 9)).pack(padx=14, pady=(12, 6))
+        value = tk.DoubleVar(value=self.animation_steps[index]["duration"])
+        tk.Scale(window, from_=0.1, to=15.0, resolution=0.1, orient=tk.HORIZONTAL,
+                 variable=value, length=240, bg=self.C_PANEL, fg=self.C_TEXT,
+                 troughcolor=self.C_SURFACE, highlightthickness=0).pack(padx=14)
+
+        def apply_and_close():
+            self.animation_steps[index]["duration"] = max(0.1, float(value.get()))
+            self._refresh_animation_list()
+            window.destroy()
+
+        tk.Button(window, text="OK", command=apply_and_close, font=(self.UI_FONT, 8),
+                  relief=tk.FLAT, bg=self.C_BTN, fg=self.C_TEXT, bd=0,
+                  highlightthickness=1, highlightbackground=self.C_BORDER,
+                  padx=10, pady=3).pack(pady=12)
+
+    def _animation_problem(self):
+        """The reason the sequence cannot be played or exported, or None."""
+        if len(self.animation_steps) < 2:
+            return ("Nothing to animate",
+                    "An animation needs at least two steps: the starting slide and "
+                    "somewhere to move to.\n\nArrange the board and press Add Step.")
+        if any(step.get("duration", 0) <= 0 for step in self.animation_steps):
+            return ("No time set",
+                    "Every step needs a time interval greater than zero.\n\n"
+                    "Use the Time slider, or double-click a step to give it its own.")
+        return None
+
+    def _step_positions(self, step):
+        """label -> (mx, my) for one keyframe."""
+        return {player["label"]: (player["mx"], player["my"])
+                for player in (step.get("board") or {}).get("players", [])
+                if player.get("label")}
+
+    def _apply_animation_frame(self, from_step, to_step, fraction):
+        """Put every player where it should be a `fraction` of the way between two
+        keyframes. Positions are in rink metres, so this is correct at any window size
+        and in either rink orientation."""
+        start = self._step_positions(from_step)
+        end = self._step_positions(to_step)
+        for label, (sx, sy) in start.items():
+            if label not in end:
+                continue
+            ex, ey = end[label]
+            mx = sx + (ex - sx) * fraction
+            my = sy + (ey - sy) * fraction
+            sid = self._get_sid_by_label(label)
+            token = self.tokens.get(sid) if sid else None
+            if not token:
+                continue
+            box = self.canvas.bbox(token.get("shape_id"))
+            if not box:
+                continue
+            nx, ny = self._rink_to_px(mx, my)
+            dx = nx - (box[0] + box[2]) / 2
+            dy = ny - (box[1] + box[3]) / 2
+            for item in self._token_items(token) + list(token.get("text_ids", [])):
+                try:
+                    self.canvas.move(item, dx, dy)
+                except Exception:
+                    pass
+
+    def play_animation(self):
+        problem = self._animation_problem()
+        if problem:
+            messagebox.showwarning(*problem)
+            return
+        if self.animation_playing:
+            return
+        self.animation_playing = True
+        # Resume from the playhead: whatever red row is showing is where it starts.
+        # Sitting on the final step -- where Add Step leaves it -- means there is
+        # nothing after it to move to, so that rewinds to the opening slide instead of
+        # finishing the moment it starts.
+        if getattr(self, "_animation_cursor", None) is None:
+            start_index = max(0, self.animation_playhead)
+            if start_index >= len(self.animation_steps) - 1:
+                start_index = 0
+            self._animation_cursor = (start_index, 0.0)
+        self._animation_tick()
+
+    def _animation_tick(self):
+        if not self.animation_playing:
+            return
+        index, elapsed = self._animation_cursor
+        if index >= len(self.animation_steps) - 1:
+            self.stop_animation(rewind=False)
+            return
+        step = self.animation_steps[index + 1]
+        duration = max(0.1, float(step.get("duration", 1.0)))
+        fraction = min(1.0, elapsed / duration)
+        self._apply_animation_frame(self.animation_steps[index], step, fraction)
+        self.animation_playhead = index if fraction < 1.0 else index + 1
+        self._refresh_animation_list()
+
+        if fraction >= 1.0:
+            self._animation_cursor = (index + 1, 0.0)
+        else:
+            self._animation_cursor = (index, elapsed + 1.0 / self.ANIMATION_FPS)
+        self.animation_job = self.root.after(int(1000 / self.ANIMATION_FPS),
+                                             self._animation_tick)
+
+    def pause_animation(self):
+        """Stop where it is; Play carries on from the same spot."""
+        self.animation_playing = False
+        if self.animation_job is not None:
+            try:
+                self.root.after_cancel(self.animation_job)
+            except Exception:
+                pass
+            self.animation_job = None
+
+    def stop_animation(self, rewind=True):
+        """Stop and go back to the opening slide."""
+        self.pause_animation()
+        self._animation_cursor = None
+        if rewind and self.animation_steps:
+            self._apply_animation_frame(self.animation_steps[0],
+                                        self.animation_steps[0], 0.0)
+            self.animation_playhead = 0
+        self._refresh_animation_list()
+
+    def export_animation_gif(self):
+        """Render the sequence to an animated GIF by walking the board through every
+        frame and capturing the canvas itself, so what is exported is what is on
+        screen."""
+        problem = self._animation_problem()
+        if problem:
+            messagebox.showwarning(*problem)
+            return
+        path = filedialog.asksaveasfilename(defaultextension=".gif",
+                                            filetypes=[("GIF", "*.gif")])
+        if not path:
+            return
+
+        self.pause_animation()
+        restore = self._board_snapshot()
+        frames, frame_ms = [], int(1000 / self.ANIMATION_FPS)
+        try:
+            for index in range(len(self.animation_steps) - 1):
+                step = self.animation_steps[index + 1]
+                count = max(1, int(round(float(step.get("duration", 1.0))
+                                         * self.ANIMATION_FPS)))
+                for frame in range(count):
+                    self._apply_animation_frame(self.animation_steps[index], step,
+                                                (frame + 1) / count)
+                    self.canvas.update()
+                    captured = self._capture_canvas()
+                    if captured is None:
+                        messagebox.showerror(
+                            "Export failed",
+                            "The board could not be captured. Exporting a GIF needs "
+                            "Ghostscript installed (the 'gs' command).")
+                        return
+                    frames.append(captured)
+            if not frames:
+                messagebox.showwarning("Nothing to export", "No frames were produced.")
+                return
+            frames[0].save(path, save_all=True, append_images=frames[1:],
+                           duration=frame_ms, loop=0, optimize=True)
+            messagebox.showinfo(
+                "Exported",
+                f"Saved {len(frames)} frames to\n{path}\n\n"
+                "Note: a watermark image is not included -- the canvas capture Tk "
+                "provides covers shapes and text only.")
+        except Exception as error:
+            messagebox.showerror("Export failed", f"Could not write the GIF:\n{error}")
+        finally:
+            self._restore_board(restore)
+            self.canvas.update()
+
+    def _capture_canvas(self):
+        """The canvas as a PIL image, via PostScript. Tk cannot hand over a bitmap of
+        a canvas directly, and screen grabs need an unobstructed window."""
+        try:
+            width = self.canvas.winfo_width()
+            height = self.canvas.winfo_height()
+            postscript = self.canvas.postscript(colormode="color", x=0, y=0,
+                                                width=width, height=height,
+                                                pagewidth=width - 1,
+                                                pageheight=height - 1)
+            image = Image.open(io.BytesIO(postscript.encode("utf-8")))
+            image.load(scale=1)
+            return image.convert("RGB")
+        except Exception:
+            return None
 
     def save_macro(self):
         if not self.undo_stack and not self.tokens:
@@ -1283,6 +2056,10 @@ class FloorballTacticsApp:
                 self.toggle_rink_orientation()
                 return
             var.set(not var.get())
+            if name == "ghosting" and not var.get():
+                # Switching ghosting off with trails all over the rink and no way to
+                # sweep them up was the awkward part: off now means gone.
+                self.clear_ghosts()
             self._update_indicators()
             if name == "half_rink" or name == "goals":
                 self.redraw_canvas()
@@ -1362,23 +2139,53 @@ class FloorballTacticsApp:
         sign_size_row = tk.Frame(signs_frame, bg=self.C_PANEL)
         sign_size_row.pack(fill=tk.X, pady=2)
         tk.Label(sign_size_row, text="Size:", bg=self.C_PANEL, font=(self.UI_FONT, 8, "bold"), width=3, anchor="w").pack(side=tk.LEFT)
-        self.sign_size_spinbox = tk.Spinbox(sign_size_row, from_=6, to=60, width=3, textvariable=self.sign_size_var, font=(self.UI_FONT, 8))
+        self.sign_size_spinbox = tk.Spinbox(sign_size_row, from_=6, to=60, width=3,
+                                            textvariable=self.sign_size_var,
+                                            command=self._apply_sign_size,
+                                            font=(self.UI_FONT, 8))
         self.sign_size_spinbox.pack(side=tk.LEFT, padx=1)
+        self.sign_size_spinbox.bind("<Return>", self._apply_sign_size)
+        self.sign_size_spinbox.bind("<FocusOut>", self._apply_sign_size)
         self.btn_sign_color = tk.Button(sign_size_row, text="", command=self.choose_sign_color, **swatch_cfg)
         self.btn_sign_color.config(bg=self.sign_color)
         self.btn_sign_color._is_swatch = True
         self.btn_sign_color.pack(side=tk.LEFT, padx=1)
-        sign_row2 = tk.Frame(signs_frame, bg=self.C_PANEL)
-        sign_row2.pack(fill=tk.X, pady=2)
-
-        # Two rows: the first three signs sit beside the size/colour controls.
-        sign_row3 = tk.Frame(signs_frame, bg=self.C_PANEL)
-        sign_row3.pack(fill=tk.X, pady=2)
+        # One grid of three uniform columns, so every button in the box is the same
+        # width whatever its label -- including Text and Image, and including the row
+        # that carries the text-size field in its third cell.
+        sign_grid = tk.Frame(signs_frame, bg=self.C_PANEL)
+        sign_grid.pack(fill=tk.BOTH, expand=True)
+        sign_btn_cfg = {k: v for k, v in gray_btn_cfg.items() if k != "width"}
         for idx, stype in enumerate(["Goal", "X", "Ball", "Square", "Triangle", "Plus"]):
-            parent = sign_row2 if idx < 3 else sign_row3
-            btn = tk.Button(parent, text=stype, command=lambda t=stype: self.set_tool(f"sign_{t.lower()}"), **gray_btn_cfg)
-            btn.pack(side=tk.LEFT, padx=3, expand=True, fill=tk.X)
+            btn = tk.Button(sign_grid, text=stype,
+                            command=lambda t=stype: self.set_tool(f"sign_{t.lower()}"),
+                            **sign_btn_cfg)
+            btn.grid(row=idx // 3, column=idx % 3, padx=3, pady=2, sticky="ew")
             self.tool_buttons[f"sign_{stype.lower()}"] = btn
+
+        # Text is a tool -- click the board to place a label. Image is not: it opens a
+        # picker and drops the picture in the middle, already selected to be dragged.
+        text_btn = tk.Button(sign_grid, text="Text", command=lambda: self.set_tool("text"),
+                             **sign_btn_cfg)
+        text_btn.grid(row=2, column=0, padx=3, pady=2, sticky="ew")
+        self.tool_buttons["text"] = text_btn
+        tk.Button(sign_grid, text="Image", command=self.add_board_image,
+                  **sign_btn_cfg).grid(row=2, column=1, padx=3, pady=2, sticky="ew")
+
+        text_size_cell = tk.Frame(sign_grid, bg=self.C_PANEL)
+        text_size_cell.grid(row=2, column=2, padx=3, pady=2, sticky="ew")
+        tk.Label(text_size_cell, text="Txt", bg=self.C_PANEL, fg=self.C_TEXT,
+                 font=(self.UI_FONT, 8, "bold")).pack(side=tk.LEFT)
+        self.text_size_spinbox = tk.Spinbox(text_size_cell, from_=self.TEXT_MIN_SIZE,
+                                            to=self.TEXT_MAX_SIZE, width=3,
+                                            textvariable=self.text_size_var,
+                                            command=self._apply_text_size,
+                                            font=(self.UI_FONT, 8))
+        self.text_size_spinbox.pack(side=tk.LEFT, padx=(3, 0), fill=tk.X, expand=True)
+        self.text_size_spinbox.bind("<Return>", self._apply_text_size)
+        self.text_size_spinbox.bind("<FocusOut>", self._apply_text_size)
+        for column in range(3):
+            sign_grid.columnconfigure(column, weight=1, uniform="sign")
 
         tactics_frame = ttk.LabelFrame(self.top_inner, style="Toolbar.TLabelframe", text=" Tactics  \u2014  0% = own goal, 100% = opponent goal ", padding=5)
         tactics_frame.pack(side=tk.LEFT, padx=3, pady=2, fill=tk.Y)
@@ -1478,6 +2285,11 @@ class FloorballTacticsApp:
         set_default_btn.pack(side=tk.LEFT, padx=3, expand=True, fill=tk.X)
         self.tool_buttons["set_default"] = set_default_btn
 
+        delete_btn = tk.Button(act_row3, text="Delete", command=self.delete_selection,
+                               **gray_btn_cfg)
+        delete_btn.pack(side=tk.LEFT, padx=3, expand=True, fill=tk.X)
+        self.tool_buttons["delete"] = delete_btn
+
         line_style_sub = tk.Frame(act_row3, bg=self.C_PANEL)
         line_style_sub.pack(side=tk.LEFT, padx=2)
         
@@ -1511,22 +2323,69 @@ class FloorballTacticsApp:
         for col in range(2):
             a_col1.columnconfigure(col, weight=1)
 
-        # Timeline is now only the step list, so it can stay narrow while spanning
-        # both toolbar rows. Its buttons moved out into General.
+        # Timeline: the action log on the left, the animation steps beside it, and the
+        # transport buttons in a column on the right. It spans both toolbar rows.
         timeline_frame = ttk.LabelFrame(self.top_inner, style="Toolbar.TLabelframe", text=" Timeline ", padding=5)
         timeline_frame.pack(side=tk.LEFT, padx=3, pady=2, fill=tk.Y)
         self._timeline_frame = timeline_frame
 
+        # The two lists are stacked rather than side by side: this box spans both
+        # toolbar rows, so it has height to spare and width it cannot spare.
         t_sub = tk.Frame(timeline_frame, bg=self.C_PANEL)
         t_sub.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-        # Roomier than the other sections because it spans both toolbar rows.
-        self.steps_listbox = tk.Listbox(t_sub, font=(self.UI_FONT, 8), selectmode=tk.SINGLE,
-                                        height=8, width=18, relief=tk.FLAT, bd=0,
-                                        highlightthickness=1, highlightbackground=self.C_BORDER,
-                                        bg=self.C_SURFACE, fg=self.C_TEXT,
-                                        selectbackground=self.C_ACCENT, selectforeground=self.C_ACCENT_FG)
-        self.steps_listbox.pack(side=tk.LEFT, padx=2, fill=tk.BOTH, expand=True)
+        # One list, not two. Every action that changes the board writes a step here and
+        # each step carries its own time, so the timeline and the animation are the
+        # same thing rather than two views that drifted apart.
+        anim_column = tk.Frame(t_sub, bg=self.C_PANEL)
+        anim_column.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=2)
+        # The playhead is a red row in this list -- the point playback starts from.
+        self.anim_listbox = tk.Listbox(anim_column, font=(self.UI_FONT, 8), selectmode=tk.SINGLE,
+                                       height=7, width=26, relief=tk.FLAT, bd=0,
+                                       highlightthickness=1, highlightbackground=self.C_BORDER,
+                                       bg=self.C_SURFACE, fg=self.C_TEXT,
+                                       selectbackground=self.C_ACCENT,
+                                       selectforeground=self.C_ACCENT_FG)
+        self.anim_listbox.pack(fill=tk.BOTH, expand=True, pady=(1, 2))
+        # The old action log lives on off-screen: commands still record and un-record
+        # their lines through it, and those lines are what name the steps above.
+        self.steps_listbox = tk.Listbox(t_sub)
+        self.anim_listbox.bind("<<ListboxSelect>>", self._on_anim_step_selected)
+        self.anim_listbox.bind("<Double-Button-1>", self._edit_step_time)
+        # Drag and drop to reorder.
+        self.anim_listbox.bind("<ButtonPress-1>", self._anim_drag_start)
+        self.anim_listbox.bind("<B1-Motion>", self._anim_drag_motion)
+        self.anim_listbox.bind("<ButtonRelease-1>", self._anim_drag_end)
+
+        time_row = tk.Frame(anim_column, bg=self.C_PANEL)
+        time_row.pack(fill=tk.X)
+        tk.Label(time_row, text="Time", bg=self.C_PANEL, fg=self.C_TEXT,
+                 font=(self.UI_FONT, 7)).pack(side=tk.LEFT)
+        self.step_time_scale = tk.Scale(time_row, from_=0.2, to=10.0, resolution=0.1,
+                                        orient=tk.HORIZONTAL, variable=self.step_time_var,
+                                        bg=self.C_PANEL, fg=self.C_TEXT,
+                                        troughcolor=self.C_SURFACE, highlightthickness=0,
+                                        font=(self.UI_FONT, 7), showvalue=True, length=90,
+                                        command=self._on_step_time_changed)
+        self.step_time_scale.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(3, 0))
+
+        anim_buttons = tk.Frame(timeline_frame, bg=self.C_PANEL)
+        anim_buttons.pack(side=tk.LEFT, fill=tk.Y, padx=(4, 0))
+        transport_cfg = {k: v for k, v in gray_btn_cfg.items() if k != "width"}
+        # One button per row, one column, uniform width: every transport button ends up
+        # the same length whatever its label.
+        for row, (label, command) in enumerate((
+                ("Add Step", self.add_animation_step),
+                ("Play", self.play_animation),
+                ("Pause", self.pause_animation),
+                ("Stop", self.stop_animation),
+                ("Up", lambda: self.move_animation_step(-1)),
+                ("Down", lambda: self.move_animation_step(1)),
+                ("Del Step", self.delete_animation_step))):
+            button = tk.Button(anim_buttons, text=label, command=command, **transport_cfg)
+            button.grid(row=row, column=0, sticky="ew", padx=1, pady=1)
+            self.anim_buttons[label] = button
+        anim_buttons.columnconfigure(0, weight=1)
 
         # General: the undo/redo and macro-file actions that used to live inside
         # Timeline & Macros. Sits first in the top row, right beside the timeline.
@@ -1541,10 +2400,12 @@ class FloorballTacticsApp:
         tk.Button(g_grid, text="Undo", command=self.undo, **general_btn_cfg).grid(row=0, column=0, padx=3, pady=2, sticky="ew")
         tk.Button(g_grid, text="Redo", command=self.redo, **general_btn_cfg).grid(row=0, column=1, padx=3, pady=2, sticky="ew")
         tk.Button(g_grid, text="Save", command=self.save_macro, **general_btn_cfg).grid(row=0, column=2, padx=3, pady=2, sticky="ew")
+        tk.Button(g_grid, text="Export", command=self.export_animation_gif, **general_btn_cfg).grid(row=0, column=3, padx=3, pady=2, sticky="ew")
         tk.Button(g_grid, text="Load", command=self.load_macro, **general_btn_cfg).grid(row=1, column=0, padx=3, pady=2, sticky="ew")
         tk.Button(g_grid, text="Watermark", command=self.add_watermark, **general_btn_cfg).grid(row=1, column=1, padx=3, pady=2, sticky="ew")
-        tk.Button(g_grid, text="Prefs", command=self.open_preferences, **general_btn_cfg).grid(row=1, column=2, padx=3, pady=2, sticky="ew")
-        for col in range(3):
+        tk.Button(g_grid, text="Reset", command=self.reset_board, **general_btn_cfg).grid(row=1, column=2, padx=3, pady=2, sticky="ew")
+        tk.Button(g_grid, text="Prefs", command=self.open_preferences, **general_btn_cfg).grid(row=1, column=3, padx=3, pady=2, sticky="ew")
+        for col in range(4):
             g_grid.columnconfigure(col, weight=1, uniform="general")
 
         self.canvas_container = tk.Frame(self.root, bg=self.C_SURFACE, bd=0,
@@ -1580,6 +2441,18 @@ class FloorballTacticsApp:
         "Watermark": "Load a logo onto the rink, then place, crop and fade it in the "
                      "editor that opens.",
         "Prefs": "Preferences: default colours, sizes and board options.",
+        "Export": "Export the animation as an animated GIF.",
+        "Reset": "Clear the board back to the starting formations, with no drawings, "
+                 "watermark, timeline or animation steps. Asks first.",
+        # Animation transport
+        "Add Step": "Freeze the board as the next animation step. The first one also "
+                    "records the opening slide, step 0.",
+        "Play": "Play the animation from the red step.",
+        "Pause": "Pause where it is. Play carries on from the same point.",
+        "Stop": "Stop and return to the opening slide.",
+        "Del Step": "Delete the step the red marker is on.",
+        "Up": "Move the selected step one place earlier in the sequence.",
+        "Down": "Move the selected step one place later in the sequence.",
         # Board settings
         "Full": "Switch to the half rink.",
         "Half": "Switch back to the full rink.",
@@ -1607,6 +2480,10 @@ class FloorballTacticsApp:
         "Square": "Stamp a square marker.",
         "Triangle": "Stamp a triangle marker.",
         "Plus": "Stamp a plus marker.",
+        "Text": "Place a text label: click the board, then type. Uses the Txt size and "
+                "the sign colour.",
+        "Image": "Put a picture on the board. Drag it to move it, or drag a corner "
+                 "handle to scale it.",
         # Drawing tools
         "Select": "Select and move players, signs and lines. Drag to box-select.",
         "Pass": "Draw a pass: a straight arrow.",
@@ -1623,6 +2500,8 @@ class FloorballTacticsApp:
         "Copy Style": "Copy the colour and shape of one player, then click others to "
                       "paste it.",
         "Default": "Save the current colours and sizes as the defaults for new boards.",
+        "Delete": "Delete everything selected -- players, signs, lines, text and "
+                  "pictures. Same as the Delete key.",
     }
 
     SWATCH_TOOLTIPS = {
@@ -1844,11 +2723,11 @@ class FloorballTacticsApp:
     # ----------------------
     # Menu layout
     # ----------------------
-    # Timeline comes first so it sits on the left whether it is spanning beside the
-    # rows or has fallen back into one of them; General follows it.
-    MENU_SECTION_ATTRS = ("_timeline_frame", "_general_frame", "_snapping_frame",
-                          "_roster_frame", "_tactics_frame", "_align_frame",
-                          "_signs_frame", "_actions_frame")
+    # Timeline comes last so it sits on the right, whether it is spanning beside the
+    # rows or has fallen back into one of them.
+    MENU_SECTION_ATTRS = ("_general_frame", "_snapping_frame", "_roster_frame",
+                          "_tactics_frame", "_align_frame", "_signs_frame",
+                          "_actions_frame", "_timeline_frame")
 
     # Two rows is a guarantee, not a preference: the toolbar never grows a third row.
     MENU_HARD_TWO_ROWS = True
@@ -2012,8 +2891,9 @@ class FloorballTacticsApp:
             # expand into what is left rather than the other way round.
             # expand as well as fill: the rows are narrower than the window, and the
             # timeline takes the slack so the toolbar fills the row rather than
-            # trailing off into empty panel.
-            spanning.pack(in_=self.top_inner, side=tk.LEFT, padx=4, pady=3,
+            # trailing off into empty panel. side=RIGHT puts it at the far end of the
+            # toolbar, past both rows of boxes.
+            spanning.pack(in_=self.top_inner, side=tk.RIGHT, padx=4, pady=3,
                           fill=tk.BOTH, expand=True)
         self.top_rows.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
@@ -2091,6 +2971,91 @@ class FloorballTacticsApp:
     # ----------------------
     # Preferences
     # ----------------------
+    # ----------------------
+    # Colour themes
+    # ----------------------
+    # att/def are the two teams, line is drawn arrows, sign is markers and text.
+    # The colour-blind sets come from the Okabe-Ito palette, which is built to stay
+    # distinguishable under all three common forms of colour blindness -- the usual
+    # red-versus-green board is exactly the pairing those readers cannot separate.
+    COLOR_THEMES = {
+        "Classic (black)": {
+            "att": "#000000", "def": "#000000", "line": "#000000", "sign": "#000000",
+            "note": "Everything in black, as on a printed sheet."},
+        "Red vs Blue": {
+            "att": "#c92a2a", "def": "#1864ab", "line": "#212529", "sign": "#212529",
+            "note": "The familiar two-team look."},
+        "Blue vs Green": {
+            "att": "#1864ab", "def": "#2b8a3e", "line": "#212529", "sign": "#212529",
+            "note": "Cooler pairing, still high contrast on white."},
+        "Slate vs Amber": {
+            "att": "#343a40", "def": "#e8590c", "line": "#495057", "sign": "#343a40",
+            "note": "Muted, easy on the eye for long sessions."},
+        "Colour-blind: Blue / Orange": {
+            "att": "#0072b2", "def": "#e69f00", "line": "#000000", "sign": "#000000",
+            "note": "Okabe-Ito. Safe for red-green colour blindness (all types)."},
+        "Colour-blind: Blue / Vermillion": {
+            "att": "#0072b2", "def": "#d55e00", "line": "#000000", "sign": "#000000",
+            "note": "Okabe-Ito. Strong separation in brightness as well as hue."},
+        "Colour-blind: Teal / Magenta": {
+            "att": "#009e73", "def": "#cc79a7", "line": "#000000", "sign": "#000000",
+            "note": "Okabe-Ito. Works for blue-yellow colour blindness too."},
+        "Nijmegen Flames": {
+            "att": "#e8262b", "def": "#4c4c4e", "line": "#4c4c4e", "sign": "#f5c518",
+            "note": "Club colours: the crest's red and slate, with its yellow for marks."},
+        "Nijmegen Hot Shots": {
+            "att": "#e8262b", "def": "#111111", "line": "#111111", "sign": "#e8262b",
+            "note": "Club colours: the logo's red on black."},
+    }
+
+    def apply_color_theme(self, name):
+        """Switch every colour at once, on the board as well as for what comes next."""
+        theme = self.COLOR_THEMES.get(name)
+        if not theme:
+            return False
+        self.color_theme = name
+        self.att_color = theme["att"]
+        self.def_color = theme["def"]
+        self.line_color = theme["line"]
+        self.sign_color = theme["sign"]
+
+        for attribute, colour in (("btn_att_color", self.att_color),
+                                  ("btn_def_color", self.def_color),
+                                  ("btn_line_color", self.line_color),
+                                  ("btn_sign_color", self.sign_color)):
+            swatch = getattr(self, attribute, None)
+            if swatch is not None:
+                try:
+                    swatch.config(bg=colour)
+                except Exception:
+                    pass
+
+        # Repaint what is already out there, rather than only affecting new pieces.
+        for token in self._all_tokens():
+            colour = self.att_color if self._token_team(token) == "att" else self.def_color
+            token["color"] = colour
+            skip = set(token.get("decor_ids", ())) | set(token.get("halo_ids", ()))
+            for item in self._token_items(token):
+                if item in skip:
+                    continue
+                try:
+                    self.canvas.itemconfig(item, fill=colour)
+                except Exception:
+                    pass
+        for cid, meta in list(self.drawn_items.items()):
+            if meta.get("decor") or meta.get("type") == "image":
+                continue
+            colour = self.sign_color if meta.get("type") in ("sign", "text") else self.line_color
+            meta["color"] = colour
+            for option in meta.get("color_options") or ("fill",):
+                try:
+                    self.canvas.itemconfig(cid, **{option: colour})
+                except Exception:
+                    pass
+
+        self._save_config()
+        return True
+
     def open_preferences(self):
         win = tk.Toplevel(self.root)
         win.title("Preferences")
@@ -2127,6 +3092,26 @@ class FloorballTacticsApp:
         row += 1
 
         row = heading("Colours", row)
+        theme_var = tk.StringVar(value=self.color_theme)
+        tk.Label(win, text="Theme:").grid(row=row, column=0, sticky="w", padx=18, pady=2)
+        theme_box = ttk.Combobox(win, textvariable=theme_var,
+                                 values=list(self.COLOR_THEMES.keys()),
+                                 width=22, state="readonly")
+        theme_box.grid(row=row, column=1, sticky="w", padx=10, pady=2)
+        row += 1
+        theme_note = tk.Label(win, text=self.COLOR_THEMES.get(self.color_theme, {})
+                              .get("note", ""), font=(self.UI_FONT, 8), fg=self.C_MUTED,
+                              wraplength=260, justify=tk.LEFT)
+        theme_note.grid(row=row, column=0, columnspan=2, sticky="w", padx=18)
+        row += 1
+
+        def on_theme_chosen(_event=None):
+            name = theme_var.get()
+            theme_note.config(text=self.COLOR_THEMES.get(name, {}).get("note", ""))
+            self.apply_color_theme(name)
+
+        theme_box.bind("<<ComboboxSelected>>", on_theme_chosen)
+
         for text, command in (("Attackers", self.choose_att_color),
                               ("Defenders", self.choose_def_color),
                               ("Lines", self.choose_line_color),
@@ -2611,41 +3596,70 @@ class FloorballTacticsApp:
         return None
 
     def create_ghosts(self, sids):
+        """Leave a faded copy of each player where it currently stands.
+
+        Returns a spec for every ghost made, so the move that caused them can carry
+        them and undo can take them away again."""
+        specs = []
         for sid in sids:
             token = self.tokens.get(sid)
-            if not token: continue
-            coords = self.canvas.coords(token["shape_id"])
-            if not coords: continue
-            
+            if not token or token.get("is_ghost"):
+                continue
+            # bbox, not coords: a square player is a polygon, and reading coords as a
+            # box dropped its ghost a whole token above where the player stood.
+            box = self.canvas.bbox(token["shape_id"])
+            if not box:
+                continue
+
             token["ghost_count"] = token.get("ghost_count", 0) + 1
-            count_idx = token["ghost_count"]
-            
-            cx, cy = (coords[0] + coords[2]) / 2, (coords[1] + coords[3]) / 2
-            label_str = f"{token['label']} [{count_idx}]"
-            
-            ghost_sid = self._create_token(cx, cy, label_str, shape=token["shape"], color=token["color"], outline="#ced4da", stipple="gray50")
-            self.tokens[ghost_sid]["is_ghost"] = True
-            self.tokens[ghost_sid]["ghost_of"] = token["shape_id"]
+            spec = {"label": f"{token['label']} [{token['ghost_count']}]",
+                    "shape": token["shape"], "color": token["color"],
+                    "size": token.get("size", 14),
+                    "cx": (box[0] + box[2]) / 2, "cy": (box[1] + box[3]) / 2,
+                    "ghost_of": token["shape_id"]}
+            self._spawn_ghost(spec)
+            specs.append(spec)
+        return specs
 
-            # Give this ghost's shape + all of its text items (the black
-            # outline copies plus the white center label) a shared tag so
-            # they can be restacked as a single atomic group. Doing the
-            # tag_lower calls one item at a time (as before) reordered the
-            # items *relative to each other* on every call, since they all
-            # also carry the "token" tag -- that's what caused the white
-            # center text to end up buried under its own black outline
-            # copies (looked like a solid black blob instead of white
-            # text with a black outline).
-            ghost_token = self.tokens[ghost_sid]
-            ghost_tag = f"ghost_{ghost_sid}"
-            for iid in [ghost_sid] + list(ghost_token.get("text_ids", [])):
-                self.canvas.addtag_withtag(ghost_tag, iid)
+    def _spawn_ghost(self, spec):
+        ghost_sid = self._create_token(spec["cx"], spec["cy"], spec["label"],
+                                       shape=spec.get("shape", "circle"),
+                                       color=spec.get("color", "black"),
+                                       outline="#ced4da", stipple="gray50",
+                                       size=spec.get("size"))
+        self.tokens[ghost_sid]["is_ghost"] = True
+        self.tokens[ghost_sid]["ghost_of"] = spec.get("ghost_of")
 
-            # Raise the whole ghost group as one call so its internal
-            # stacking order (white text on top of the black outline
-            # copies) is preserved, while still placing it just above the
-            # pitch and below any "real" (non-ghost) tokens.
-            self.canvas.tag_raise(ghost_tag, "pitch")
+        # Give this ghost's shape + all of its text items (the black
+        # outline copies plus the white center label) a shared tag so
+        # they can be restacked as a single atomic group. Doing the
+        # tag_lower calls one item at a time (as before) reordered the
+        # items *relative to each other* on every call, since they all
+        # also carry the "token" tag -- that's what caused the white
+        # center text to end up buried under its own black outline
+        # copies (looked like a solid black blob instead of white
+        # text with a black outline).
+        ghost_token = self.tokens[ghost_sid]
+        ghost_tag = f"ghost_{ghost_sid}"
+        for iid in self._token_items(ghost_token) + list(ghost_token.get("text_ids", [])):
+            self.canvas.addtag_withtag(ghost_tag, iid)
+
+        # Raise the whole ghost group as one call so its internal
+        # stacking order (white text on top of the black outline
+        # copies) is preserved, while still placing it just above the
+        # pitch and below any "real" (non-ghost) tokens.
+        self.canvas.tag_raise(ghost_tag, "pitch")
+        return ghost_sid
+
+    def clear_ghosts(self):
+        """Remove every ghost on the board. Returns how many went."""
+        removed = 0
+        for token in [t for t in list(self.tokens.values()) if t.get("is_ghost")]:
+            if token.get("shape_id") in self.tokens:
+                self._delete_token(token)
+                removed += 1
+        self.selected_tokens = [s for s in self.selected_tokens if s in self.tokens]
+        return removed
 
     def place_sign_canvas(self, x, y, sign_type, size=None):
         color = self.sign_color
@@ -2655,6 +3669,8 @@ class FloorballTacticsApp:
         # they can be moved or re-snapped as one thing later.
         self._sign_group_seq = getattr(self, "_sign_group_seq", 0) + 1
         group_tag = f"signgrp{self._sign_group_seq}"
+        # Parts that carry no colour of their own -- the holes punched in the ball.
+        decor_items = set()
         sc = getattr(self, 'pitch_scale', 20)
         size_value = max(6, int(self.sign_size_var.get())) if size is None else max(6, int(size))
         # Every sign spans the same 2 * size_value box, so switching sign type does
@@ -2689,9 +3705,11 @@ class FloorballTacticsApp:
             for angle in (90, 210, 330):
                 hx = x + math.cos(math.radians(angle)) * s * 0.45
                 hy = y - math.sin(math.radians(angle)) * s * 0.45
-                created.append(self.canvas.create_oval(
+                hole = self.canvas.create_oval(
                     hx - hole_r, hy - hole_r, hx + hole_r, hy + hole_r,
-                    fill=self.C_SURFACE, outline=self.C_SURFACE, tags=("sign",)))
+                    fill=self.C_SURFACE, outline=self.C_SURFACE, tags=("sign",))
+                created.append(hole)
+                decor_items.add(hole)
         elif sign_lower == "square":
             # Polygon for the same reason as the goal: rectangles cannot be rotated.
             id1 = self.canvas.create_polygon(x-s, y-s, x+s, y-s, x+s, y+s, x-s, y+s,
@@ -2708,7 +3726,8 @@ class FloorballTacticsApp:
             self.canvas.addtag_withtag(group_tag, cid)
             self._register_drawn_item(cid, {"type": "sign", "sign_type": sign_type,
                                             "color": color, "size": size_value,
-                                            "group": group_tag})
+                                            "group": group_tag,
+                                            "decor": cid in decor_items})
         return created
 
     def on_canvas_press(self, event):
@@ -2737,7 +3756,8 @@ class FloorballTacticsApp:
 
         if clicked_item in self.selection_overlay_handles and self.active_tool is None:
             handle_type = self._get_handle_type(clicked_item)
-            if self._is_line_selection() and handle_type in {"line_mid", "line_start", "line_end"}:
+            if self._is_line_selection() and handle_type in {"line_mid", "line_start",
+                                                             "line_end", "line_bend"}:
                 self.line_edit_mode = True
                 self.line_edit_handle = handle_type
                 self.line_edit_start = (event.x, event.y)
@@ -2771,7 +3791,10 @@ class FloorballTacticsApp:
                 if clicked not in self.selected_tokens: self.selected_tokens = list(target_sids)
 
             self.highlight_selected()
-            if self.ghosting_var.get(): self.create_ghosts(self.selected_tokens)
+            # Held until the drag ends, then handed to the move command so undo takes
+            # the ghost back along with the movement.
+            self._drag_ghosts = (self.create_ghosts(self.selected_tokens)
+                                 if self.ghosting_var.get() else [])
             
             self.drag_data["x"] = event.x
             self.drag_data["y"] = event.y
@@ -2812,6 +3835,10 @@ class FloorballTacticsApp:
             self.clear_selection()
             self.selection_start = (event.x, event.y)
             self.selection_rect = self.canvas.create_rectangle(event.x, event.y, event.x, event.y, dash=(4,4), outline="#228be6")
+        elif self.active_tool == "text":
+            self.place_text_canvas(event.x, event.y)
+            self.active_tool = None
+            self._update_indicators()
         elif self.active_tool and self.active_tool.startswith("sign_"):
             stype = self.active_tool.split("_")[1]
             px, py = event.x, event.y
@@ -2852,6 +3879,12 @@ class FloorballTacticsApp:
             elif self.line_edit_handle == "line_end":
                 new_coords[-2] = coords[-2] + dx
                 new_coords[-1] = coords[-1] + dy
+            elif self.line_edit_handle == "line_bend" and len(new_coords) >= 6:
+                # Only the control point moves: the two ends stay where they were put,
+                # so reshaping a curve never drags its start or its target with it.
+                new_coords[2] = coords[2] + dx
+                new_coords[3] = coords[3] + dy
+                self._move_paired_bend(line_id, dx, dy)
             self.canvas.coords(line_id, *new_coords)
             self.line_edit_start = (event.x, event.y)
             self._draw_selection_overlay()
@@ -3018,7 +4051,9 @@ class FloorballTacticsApp:
                 # and making tokens (and any ghosts left behind) jump
                 # past where you dropped them. We only want the command
                 # recorded for undo/redo, not re-applied now.
-                cmd = MoveTokensCommand(self, label_moves)
+                cmd = MoveTokensCommand(self, label_moves,
+                                        ghosts=getattr(self, "_drag_ghosts", None))
+                self._drag_ghosts = []
                 self.push_command(cmd, execute=False)
             self.drag_start_positions.clear()
             return
@@ -3111,6 +4146,11 @@ class FloorballTacticsApp:
             except Exception:
                 pass
         for cid, meta in list(self.drawn_items.items()):
+            if meta.get("decor") or meta.get("type") == "image":
+                # The ball's holes carry the rink's colour rather than the sign's, and
+                # a picture has no fill at all: repainting either on deselect turned
+                # every ball solid.
+                continue
             # Restore only the options that actually carry this item's colour. A
             # blanket fill= floods outline-only shapes (Square/Triangle signs) solid
             # the moment they are deselected.
@@ -3171,6 +4211,17 @@ class FloorballTacticsApp:
                         handle_id = self.canvas.create_oval(hx - 4, hy - 4, hx + 4, hy + 4, fill="#4dabf7", outline="#ffffff", width=1, tags=("selection_overlay", "resize_handle"))
                         self.selection_overlay_handles.append(handle_id)
                         self.selection_overlay_handle_types.append(handle_name)
+                    # A curve carries its shape in a middle control point. Give it a
+                    # handle of its own -- orange, to separate it from the blue ones
+                    # that move the line -- so a bend can be reshaped after drawing.
+                    if len(coords) >= 6:
+                        bx, by = coords[2], coords[3]
+                        handle_id = self.canvas.create_oval(
+                            bx - 5, by - 5, bx + 5, by + 5, fill=self.BEND_HANDLE_COLOR,
+                            outline="#ffffff", width=1,
+                            tags=("selection_overlay", "resize_handle"))
+                        self.selection_overlay_handles.append(handle_id)
+                        self.selection_overlay_handle_types.append("line_bend")
                 else:
                     handle_positions = [(x1, y1), (x2, y1), (x1, y2), (x2, y2)]
                     for x, y in handle_positions:
@@ -3318,6 +4369,11 @@ class FloorballTacticsApp:
                 self.canvas.coords(cid, *new_coords)
             except Exception:
                 pass
+            # An image is a single anchor point, so scaling its coordinates only moves
+            # it. Its bitmap has to be redrawn at the new size to actually resize.
+            self._scale_board_image(cid, scale_x, scale_y)
+            # Text is a point too: the type size is what makes it bigger or smaller.
+            self._scale_board_text(cid, max(scale_x, scale_y))
 
         for sid in list(self.selected_tokens):
             token = self.tokens.get(sid)
@@ -3368,6 +4424,25 @@ class FloorballTacticsApp:
         if not line_id:
             return []
         return self.canvas.coords(line_id)[:]
+
+    def _move_paired_bend(self, line_id, dx, dy):
+        """With Arches on, a bend is drawn as two offset curves. They were created from
+        one drawing, so they share their metadata -- which is how the twin is found and
+        kept in step when the control point is dragged."""
+        meta = self.drawn_items.get(line_id)
+        if not meta or meta.get("tool") != "bend":
+            return
+        data = meta.get("data")
+        for other, other_meta in self.drawn_items.items():
+            if other == line_id or other_meta.get("tool") != "bend":
+                continue
+            if data is not None and other_meta.get("data") is not data:
+                continue
+            coords = self.canvas.coords(other)
+            if len(coords) >= 6:
+                coords[2] += dx
+                coords[3] += dy
+                self.canvas.coords(other, *coords)
 
     def _is_line_selection(self):
         return self._get_selected_line_item() is not None
@@ -3462,11 +4537,18 @@ class FloorballTacticsApp:
                 except Exception:
                     pass
         for cid in self.drawn_items:
+            meta = self.drawn_items.get(cid, {})
+            if meta.get("decor"):
+                # The holes in the ball carry the rink's colour, not the sign's.
+                # Repainting them here turned every ball solid the moment anything
+                # was selected.
+                continue
+            if meta.get("type") == "image":
+                continue                      # a picture has no fill to recolour
             try:
                 if cid in self.selected_drawn:
                     self.canvas.itemconfig(cid, fill="#228be6", outline="#228be6")
                 else:
-                    meta = self.drawn_items.get(cid, {})
                     color = meta.get("color", self.line_color)
                     self.canvas.itemconfig(cid, fill=color, outline=color)
             except Exception:
@@ -3920,7 +5002,8 @@ class FloorballTacticsApp:
                 "menu_two_rows": self.menu_two_rows,
                 "menu_rows_mode": self.menu_rows_mode,
                 "menu_position": self.menu_position,
-                "rink_rotated": self.rink_rotated
+                "rink_rotated": self.rink_rotated,
+                "color_theme": self.color_theme
             }
             with open(self.config_path, "w") as f:
                 json.dump(cfg, f, indent=2)
@@ -4464,6 +5547,8 @@ class FloorballTacticsApp:
             except Exception:
                 pass
             self.drawn_items.pop(cid, None)
+            # Drop the picture with the item, or its PIL copy is kept alive forever.
+            self.board_images.pop(cid, None)
             removed += 1
         self.selected_drawn.clear()
         self.selected_tokens = [s for s in self.selected_tokens if s in self.tokens]
@@ -4524,6 +5609,9 @@ class FloorballTacticsApp:
             menu.add_command(label="Paste", command=self.paste_clipboard,
                              state=tk.NORMAL if self.clipboard else tk.DISABLED)
             menu.add_command(label="Select All", command=self.select_all)
+            has_ghosts = any(t.get("is_ghost") for t in self.tokens.values())
+            menu.add_command(label="Clear Ghosts", command=self.clear_ghosts,
+                             state=tk.NORMAL if has_ghosts else tk.DISABLED)
             menu.add_separator()
             menu.add_command(label="Undo", command=self.undo,
                              state=tk.NORMAL if self.undo_stack else tk.DISABLED)
