@@ -1,4 +1,4 @@
-# floorball_animator.py
+# floorball_studio.py
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog, colorchooser
 from tkinter import font as tkfont
