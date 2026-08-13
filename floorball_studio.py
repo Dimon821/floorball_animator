@@ -7,6 +7,7 @@ import math
 import os
 import io
 import base64
+import datetime
 import json
 import pathlib
 import time
@@ -130,18 +131,7 @@ class MoveTokensCommand(Command):
                     self.app.canvas.move(tid, dx, dy)
             if not self.keep_attached:
                 return
-            for line_id in token.get("attached_lines_start", []):
-                coords = self.app.canvas.coords(line_id)
-                if coords and len(coords) >= 4:
-                    coords[0] += dx
-                    coords[1] += dy
-                    self.app.canvas.coords(line_id, *coords)
-            for line_id in token.get("attached_lines_end", []):
-                coords = self.app.canvas.coords(line_id)
-                if coords and len(coords) >= 4:
-                    coords[-2] += dx
-                    coords[-1] += dy
-                    self.app.canvas.coords(line_id, *coords)
+            self.app.move_attached_line_ends(token, dx, dy)
 
     def serialize(self):
         return {"type": "move_tokens", "moves": self.label_moves}
@@ -363,7 +353,7 @@ class Tooltip:
 
     def _show(self):
         # The text may be a callable when the caption depends on state that changes
-        # after the toolbar is built -- the Full/Half button relabels itself.
+        # after the toolbar is built -- the rink button relabels itself.
         text = self.text() if callable(self.text) else self.text
         if self.window is not None or not text:
             return
@@ -440,7 +430,15 @@ class DrawLineCommand(Command):
         self.line_ids = self.app.draw_tactical_line_canvas(self.tool, self.x1, self.y1, self.x2, self.y2, preview=False, extra_data=self.extra_data)
         # register drawn items in app.drawn_items
         for lid in self.line_ids:
-            self.app.drawn_items[lid] = {"type": "tactic_line", "tool": self.tool, "data": self.drawing_data, "color": self.app.line_color}
+            # Through _register_drawn_item, so a box or circle records that its colour
+            # lives in outline= alone. Written straight into drawn_items it would fall
+            # back to fill= and turn solid the first time anything was selected. The
+            # group tag the drawing was given is carried over, not dropped.
+            existing = self.app.drawn_items.get(lid) or {}
+            self.app._register_drawn_item(lid, {"type": "tactic_line", "tool": self.tool,
+                                                "group": existing.get("group"),
+                                                "data": self.drawing_data,
+                                                "color": self.app.line_color})
         self.app.drawings.append((self.line_ids, self.drawing_data))
         self.app.action_steps.append(self.step_desc)
         try:
@@ -553,6 +551,74 @@ class LockCommand(Command):
     def serialize(self):
         return {"type": "lock", "labels": self.labels, "lock_state": self.lock_state}
 
+class DeleteTokensCommand(Command):
+    """Taking players off the board, as something undo can put back.
+
+    Deleting used to happen straight on the canvas, so a player removed by mistake
+    was gone for good -- Ctrl+Z would step past it to whatever came before. What is
+    kept here is everything needed to build the same player again: who they are, how
+    they are drawn, and where they stood, in rink metres so the spot is still right
+    if the window or the field has changed since."""
+
+    def __init__(self, app, tokens):
+        self.app = app
+        self.specs = [app._token_spec(token) for token in tokens]
+        self.specs = [spec for spec in self.specs if spec]
+
+    def execute(self):
+        for spec in self.specs:
+            sid = self.app._get_sid_by_label(spec["label"])
+            token = self.app.tokens.get(sid) if sid else None
+            if token:
+                self.app._delete_token(token)
+        self.app._refresh_roster_counts()
+
+    def undo(self):
+        for spec in self.specs:
+            self.app._restore_token(spec)
+        self.app._refresh_roster_counts()
+
+    def serialize(self):
+        return {"type": "delete_tokens", "players": self.specs}
+
+
+class HidePitchPartsCommand(Command):
+    """Take a fixture of the rink itself off the board -- a goal, a face-off cross,
+    the centre line, the boards -- or put it back.
+
+    It cannot simply delete the canvas items: the rink is thrown away and redrawn
+    from scratch on every resize, every rotation and every switch between a full and
+    a half rink. What is remembered instead is which parts to leave out, and the
+    drawing skips them from then on."""
+
+    def __init__(self, app, keys, hide=True):
+        self.app = app
+        self.keys = set(keys)
+        self.hide = hide
+        self.changed = set()
+
+    def execute(self):
+        if self.hide:
+            self.changed = self.keys - self.app.hidden_pitch_parts
+            self.app.hidden_pitch_parts |= self.changed
+        else:
+            self.changed = self.keys & self.app.hidden_pitch_parts
+            self.app.hidden_pitch_parts -= self.changed
+        self.app.selected_pitch_parts.clear()
+        self.app._apply_hidden_pitch_parts()
+        self.app.highlight_selected()
+
+    def undo(self):
+        if self.hide:
+            self.app.hidden_pitch_parts -= self.changed
+        else:
+            self.app.hidden_pitch_parts |= self.changed
+        self.app._apply_hidden_pitch_parts()
+        self.app.highlight_selected()
+
+    def serialize(self):
+        return {"type": "pitch_parts", "keys": sorted(self.keys), "hide": self.hide}
+
 
 # ==========================================
 # MAIN APPLICATION
@@ -653,8 +719,19 @@ class FloorballTacticsApp:
 
         self.selected_tokens = []      # selected token shape ids
         self.selected_drawn = set()    # selected drawn canvas ids
+        # Fixtures of the rink -- goals, face-off crosses, the centre line, the
+        # boards -- can be selected and removed like anything else. They are held by
+        # name rather than by canvas id because the rink is redrawn from scratch
+        # whenever the window changes size or the board is rotated.
+        self.selected_pitch_parts = set()
+        self.hidden_pitch_parts = set()
         self.selection_rect = None
         self.selection_start = None
+        # Where attached arrows sat when playback began; None means "not captured".
+        self._attached_origins = None
+        self.zoom = 1.0
+        self.pan_x = 0.0
+        self.pan_y = 0.0
 
         self.drag_start_positions = {} 
         self.drag_data = {"x": 0, "y": 0}
@@ -680,11 +757,13 @@ class FloorballTacticsApp:
 
         self.GRID = 15
         self.grid_var = tk.BooleanVar(value=False)
+        # Two independent choices: which field, and whether only one end of it is
+        # drawn. The board opens on half a 5v5 rink, which is what most drills use.
         self.half_rink_var = tk.BooleanVar(value=True)
+        self.rink_mode_var = tk.StringVar(value="5v5")
         self.snap_player_var = tk.BooleanVar(value=True)
         self.snap_angle_var = tk.BooleanVar(value=False)
         self.ghosting_var = tk.BooleanVar(value=False)
-        self.curved_arches_var = tk.BooleanVar(value=False)
         self.goals_visible_var = tk.BooleanVar(value=True)
         self.player_size_var = tk.StringVar(value="14")
         self.sign_size_var = tk.StringVar(value="12")
@@ -758,7 +837,18 @@ class FloorballTacticsApp:
             ("<Control-a>", lambda e: self.select_all()),
             ("<Control-A>", lambda e: self.select_all()),
             ("<Delete>", self._delete_key),
-            ("<BackSpace>", self._delete_key),
+            ("<BackSpace>", self._remove_key),
+            # Ctrl and the zoom keys. Tk reports the same key differently depending on
+            # whether Shift is involved and which keyboard it is, so plus, equal and
+            # KP_Add all have to be bound for "zoom in" to work everywhere.
+            ("<Control-plus>", self.zoom_in),
+            ("<Control-equal>", self.zoom_in),
+            ("<Control-KP_Add>", self.zoom_in),
+            ("<Control-minus>", self.zoom_out),
+            ("<Control-underscore>", self.zoom_out),
+            ("<Control-KP_Subtract>", self.zoom_out),
+            ("<Control-0>", self.zoom_reset),
+            ("<Control-KP_0>", self.zoom_reset),
         ]
         for sequence, callback in bindings:
             self.root.bind_all(sequence, callback)
@@ -782,6 +872,12 @@ class FloorballTacticsApp:
                 self.att_pct_var = tk.StringVar(value=str(cfg.get("att_pct", self.att_pct_var.get())))
                 self.def_pct_var = tk.StringVar(value=str(cfg.get("def_pct", self.def_pct_var.get())))
                 self.half_rink_var = tk.BooleanVar(value=cfg.get("half_rink", self.half_rink_var.get()))
+                # Older config files name the fields the way the app used to, and the
+                # oldest have nothing but the half/full flag; _read_rink_mode reads
+                # both and hands back the field and the half separately.
+                saved_mode, saved_half = self._read_rink_mode(cfg)
+                self.rink_mode_var = tk.StringVar(value=saved_mode)
+                self.half_rink_var.set(saved_half)
                 self.grid_var = tk.BooleanVar(value=False)
                 self.snap_player_var = tk.BooleanVar(value=cfg.get("snap_player", self.snap_player_var.get()))
                 self.snap_angle_var = tk.BooleanVar(value=cfg.get("snap_angle", self.snap_angle_var.get()))
@@ -814,6 +910,7 @@ class FloorballTacticsApp:
                 "att_pct": self.att_pct_var.get(),
                 "def_pct": self.def_pct_var.get(),
                 "half_rink": self.half_rink_var.get(),
+                "rink_mode": self.rink_mode,
                 "grid": self.grid_var.get(),
                 "snap_player": self.snap_player_var.get(),
                 "snap_angle": self.snap_angle_var.get(),
@@ -841,8 +938,15 @@ class FloorballTacticsApp:
         recorder = getattr(cmd, "record", None)
         if callable(recorder):
             recorder()
+        # Which group this instruction belongs to. Saving uses it to tell a superseded
+        # instruction from one that merely looks similar but happens later in the play.
+        cmd.animation_group = max(0, len(self.animation_steps) - 1)
         self.undo_stack.append(cmd)
         self.redo_stack.clear()
+        # The board has changed under it, so whatever playback remembered about the
+        # arrows is stale.
+        self._attached_origins = None
+        self._sync_full_coords()
         self._save_config()
 
     def undo(self, event=None):
@@ -1023,11 +1127,10 @@ class FloorballTacticsApp:
                 if sid is None or sid in seen:
                     continue
                 seen.add(sid)
-                bbox = self.canvas.bbox(sid)
-                if not bbox:
+                centre = self._token_centre_px(token)
+                if not centre:
                     continue
-                mx, my = self._state_px_to_m((bbox[0] + bbox[2]) / 2,
-                                             (bbox[1] + bbox[3]) / 2, state)
+                mx, my = self._state_px_to_m(centre[0], centre[1], state)
                 players.append({
                     "label": token.get("label"),
                     "team": self._token_team(token),
@@ -1039,9 +1142,13 @@ class FloorballTacticsApp:
                 })
         return {
             "half_rink": bool(self.half_rink_var.get()),
+            "rink_mode": self.rink_mode,
             "rink_rotated": bool(self.rink_rotated),
             "players": players,
             "watermark": self._watermark_snapshot(),
+            # Which fixtures of the rink were taken off it. Part of the board, not of
+            # the command log: a snapshot has to describe the rink as it looked.
+            "hidden_pitch_parts": sorted(self.hidden_pitch_parts),
         }
 
     def _watermark_snapshot(self):
@@ -1156,8 +1263,273 @@ class FloorballTacticsApp:
         self._refresh_watermark_image()
         self._render_watermark()
 
+    # ----------------------
+    # The whole play, as data
+    # ----------------------
+    # Canvas options worth recording per item type. Everything about how a mark looks
+    # travels with it, so a file reopens looking exactly like the board it was saved
+    # from rather than being re-derived from the tool that happened to draw it.
+    ITEM_STYLE_OPTIONS = {
+        "line": ("fill", "width", "dash", "arrow", "arrowshape", "smooth", "capstyle"),
+        "polygon": ("fill", "outline", "width", "dash", "smooth"),
+        "oval": ("fill", "outline", "width", "dash"),
+        "rectangle": ("fill", "outline", "width", "dash"),
+        "arc": ("fill", "outline", "width", "style", "start", "extent"),
+        "text": ("fill", "text", "font", "anchor", "justify"),
+        "image": ("anchor",),
+    }
+    # Kept out of the file: canvas ids that mean nothing in another session, and the
+    # live PIL objects behind a picture.
+    ITEM_META_SKIP = ("full_coords", "photo", "original", "image")
+
+    def _drawings_snapshot(self):
+        """Every mark on the board, in rink metres.
+
+        The command log alone cannot reproduce a play. It records the pixels a line
+        was drawn between, which mean nothing in another window size, on another
+        field, or at another zoom -- which is why reopening a file used to scatter the
+        arrows. What is written here is the geometry itself, in the same metres the
+        players are saved in, plus the style each item carries and the group it
+        belongs to in the animation."""
+        state = self._pitch_state()
+        if not state.get("scale"):
+            return []
+        items = []
+        for cid, meta in self.drawn_items.items():
+            try:
+                kind = self.canvas.type(cid)
+                coords = self.canvas.coords(cid)
+            except Exception:
+                continue
+            if not kind:
+                continue
+            # full_coords, not the live ones: an arrow part-way through being revealed
+            # would otherwise be saved half drawn.
+            geometry = meta.get("full_coords") or coords
+            points = [self._state_px_to_m(geometry[i], geometry[i + 1], state)
+                      for i in range(0, len(geometry) - 1, 2)]
+            entry = {
+                "kind": kind,
+                "points_m": [[round(mx, 4), round(my, 4)] for mx, my in points],
+                "style": self._item_style(cid, kind),
+                "meta": {key: value for key, value in meta.items()
+                         if key not in self.ITEM_META_SKIP
+                         and isinstance(value, (str, int, float, bool, type(None), list))},
+            }
+            data = meta.get("data")
+            if isinstance(data, dict):
+                # The record a tool drew from, in metres too, so a bend keeps its
+                # control point and an attached arrow keeps knowing which way it runs.
+                entry["data"] = dict(data)
+                for a, b in (("x1", "y1"), ("x2", "y2")):
+                    if a in data and b in data:
+                        mx, my = self._state_px_to_m(data[a], data[b], state)
+                        entry["data"][a + "_m"], entry["data"][b + "_m"] = (round(mx, 4),
+                                                                           round(my, 4))
+                extra = data.get("extra") or {}
+                if "cx" in extra and "cy" in extra:
+                    mx, my = self._state_px_to_m(extra["cx"], extra["cy"], state)
+                    entry["data"]["cx_m"], entry["data"]["cy_m"] = round(mx, 4), round(my, 4)
+            if kind == "image":
+                entry["image"] = self._board_image_snapshot(cid)
+            items.append(entry)
+        return items
+
+    def _item_style(self, cid, kind):
+        style = {}
+        for option in self.ITEM_STYLE_OPTIONS.get(kind, ()):
+            try:
+                value = self.canvas.itemcget(cid, option)
+            except Exception:
+                continue
+            if value not in ("", None):
+                style[option] = value
+        return style
+
+    def _board_image_snapshot(self, cid):
+        """A placed picture, pixels and all, so the file carries it the way a macro
+        carries its watermark."""
+        record = self.board_images.get(cid)
+        if not record or not record.get("original"):
+            return None
+        try:
+            buffer = io.BytesIO()
+            record["original"].save(buffer, format="PNG", optimize=True)
+        except Exception:
+            return None
+        state = self._pitch_state()
+        return {"png_base64": base64.b64encode(buffer.getvalue()).decode("ascii"),
+                "path": record.get("path"),
+                "w_m": round(record.get("w_px", 1) / (state.get("scale") or 1), 4),
+                "h_m": round(record.get("h_px", 1) / (state.get("scale") or 1), 4)}
+
+    def _restore_drawings(self, entries):
+        """Put every saved mark back on the board, converting its metres to the pixels
+        of the rink as it is drawn now."""
+        state = self._pitch_state()
+        if not state.get("scale") or not entries:
+            return []
+        for cid in list(self.drawn_items):
+            try:
+                self.canvas.delete(cid)
+            except Exception:
+                pass
+        self.drawn_items.clear()
+        self.board_images.clear()
+
+        restored = []
+        for entry in entries:
+            kind = entry.get("kind")
+            points = [self._state_m_to_px(mx, my, state)
+                      for mx, my in entry.get("points_m") or ()]
+            flat = [value for point in points for value in point]
+            style = dict(entry.get("style") or {})
+            meta = dict(entry.get("meta") or {})
+            cid = None
+            try:
+                if kind == "image":
+                    cid = self._restore_board_image(entry, points, state)
+                elif kind == "text":
+                    text = style.pop("text", meta.get("text", ""))
+                    cid = self.canvas.create_text(*flat[:2], text=text,
+                                                  tags=("sign",), **style)
+                elif kind == "line" and len(flat) >= 4:
+                    cid = self.canvas.create_line(*flat, tags=("tactic_line",), **style)
+                elif kind == "polygon" and len(flat) >= 6:
+                    cid = self.canvas.create_polygon(*flat, tags=("sign",), **style)
+                elif kind in ("oval", "rectangle", "arc") and len(flat) >= 4:
+                    maker = {"oval": self.canvas.create_oval,
+                             "rectangle": self.canvas.create_rectangle,
+                             "arc": self.canvas.create_arc}[kind]
+                    cid = maker(*flat[:4], tags=("sign",), **style)
+            except Exception:
+                cid = None
+            if cid is None:
+                continue
+            data = entry.get("data")
+            if isinstance(data, dict):
+                data = dict(data)
+                for a, b in (("x1", "y1"), ("x2", "y2")):
+                    if a + "_m" in data:
+                        px, py = self._state_m_to_px(data.pop(a + "_m"),
+                                                     data.pop(b + "_m"), state)
+                        data[a], data[b] = px, py
+                if "cx_m" in data:
+                    px, py = self._state_m_to_px(data.pop("cx_m"), data.pop("cy_m"), state)
+                    data.setdefault("extra", {}).update({"cx": px, "cy": py})
+                meta["data"] = data
+            if meta.get("group"):
+                try:
+                    self.canvas.addtag_withtag(meta["group"], cid)
+                except Exception:
+                    pass
+            self._register_drawn_item(cid, meta)
+            self.drawn_items[cid]["full_coords"] = list(self.canvas.coords(cid))
+            restored.append(cid)
+        return restored
+
+    def _restore_board_image(self, entry, points, state):
+        payload = entry.get("image") or {}
+        encoded = payload.get("png_base64")
+        if not encoded or not points:
+            return None
+        try:
+            image = Image.open(io.BytesIO(base64.b64decode(encoded))).convert("RGBA")
+        except Exception:
+            return None
+        scale = state.get("scale") or 1
+        record = {"original": image, "path": payload.get("path"),
+                  "w_px": max(1, payload.get("w_m", 1) * scale),
+                  "h_px": max(1, payload.get("h_m", 1) * scale)}
+        return self._draw_board_image(record, points[0][0], points[0][1])
+
+    def _animation_snapshot(self):
+        """The whole sequence: every group, what is in it, how long it runs and when it
+        starts. The board of each group is already in metres, so a saved play reopens
+        as the same play rather than as one long group with everything in it."""
+        groups, elapsed = [], 0.0
+        for index, step in enumerate(self.animation_steps):
+            duration = float(step.get("duration", 1.0))
+            groups.append({
+                "index": index,
+                "name": step.get("name") or f"Group {index}",
+                "named": bool(step.get("named")),
+                "closed": bool(step.get("closed")),
+                # Group 0 is the board as it stands, so the clock starts at the end of
+                # it: every later group begins where the one before finished.
+                "starts_at": round(elapsed, 3),
+                "duration": round(duration, 3),
+                "ends_at": round(elapsed + (duration if index else 0.0), 3),
+                "actions": list(step.get("actions") or []),
+                "board": step.get("board"),
+            })
+            if index:
+                elapsed += duration
+        return {"fps": self.ANIMATION_FPS, "playhead": self.animation_playhead,
+                "total_seconds": round(elapsed, 3), "groups": groups}
+
+    def _restore_animation(self, payload):
+        """Rebuild the timeline from a saved play."""
+        if not isinstance(payload, dict):
+            return False
+        groups = payload.get("groups")
+        if not isinstance(groups, list):
+            return False
+        self.animation_steps = []
+        for entry in groups:
+            if not isinstance(entry, dict):
+                continue
+            self.animation_steps.append({
+                "name": entry.get("name") or f"Group {len(self.animation_steps)}",
+                "named": bool(entry.get("named")),
+                "closed": bool(entry.get("closed", True)),
+                "duration": max(0.0, float(entry.get("duration", 1.0))),
+                "actions": list(entry.get("actions") or []),
+                "board": entry.get("board"),
+            })
+        self.animation_playhead = max(0, min(int(payload.get("playhead", 0)),
+                                             max(0, len(self.animation_steps) - 1)))
+        self._refresh_animation_list()
+        return True
+
+    def _attachments_snapshot(self, order):
+        """Which arrows are snapped to which player, by position in the drawings list."""
+        index_of = {cid: position for position, cid in enumerate(order)}
+        found = {}
+        seen = set()
+        for token in self.tokens.values():
+            sid = token.get("shape_id") if isinstance(token, dict) else None
+            if sid is None or sid in seen or not token.get("label"):
+                continue
+            seen.add(sid)
+            starts = [index_of[cid] for cid in token.get("attached_lines_start") or ()
+                      if cid in index_of]
+            ends = [index_of[cid] for cid in token.get("attached_lines_end") or ()
+                    if cid in index_of]
+            if starts or ends:
+                found[token["label"]] = {"start": starts, "end": ends}
+        return found
+
+    def _restore_attachments(self, payload, restored):
+        for label, entry in (payload or {}).items():
+            sid = self._get_sid_by_label(label)
+            token = self.tokens.get(sid) if sid else None
+            if not token or not isinstance(entry, dict):
+                continue
+            token["attached_lines_start"] = [restored[i] for i in entry.get("start", [])
+                                             if 0 <= i < len(restored)]
+            token["attached_lines_end"] = [restored[i] for i in entry.get("end", [])
+                                           if 0 <= i < len(restored)]
+
     def _restore_board(self, board):
         players = [p for p in (board.get("players") or []) if p.get("label")]
+        # The rink itself, before anything is placed on it. Only when the file says
+        # something about it, so an older macro leaves the board as it is.
+        if "hidden_pitch_parts" in board:
+            wanted = set(board.get("hidden_pitch_parts") or ())
+            if wanted != self.hidden_pitch_parts:
+                self.hidden_pitch_parts = wanted
+                self._apply_hidden_pitch_parts()
         # Before the early return below: a macro may carry a watermark and no players.
         # Pushed as a command rather than applied directly, so loading a logo shows up
         # in the timeline and can be undone like anything else.
@@ -1170,10 +1542,10 @@ class FloorballTacticsApp:
         if not players:
             return
         # Restore the view first: the saved metres describe positions on that rink.
-        if bool(self.half_rink_var.get()) != bool(board.get("half_rink", self.half_rink_var.get())):
-            self.half_rink_var.set(bool(board.get("half_rink")))
-            self._update_indicators()
-            self.redraw_canvas()
+        # Which field, and whether it was the half of it, are two separate answers,
+        # and a file written before that was true has only the old names to give.
+        wanted_mode, wanted_half = self._read_rink_mode(board)
+        self.set_rink_mode(wanted_mode, half=wanted_half)
         if bool(self.rink_rotated) != bool(board.get("rink_rotated", self.rink_rotated)):
             self.rotate_rink("vertical" if board.get("rink_rotated") else "horizontal")
 
@@ -1187,12 +1559,12 @@ class FloorballTacticsApp:
             token = self.tokens.get(sid) if sid else None
             if not token:
                 continue
-            bbox = self.canvas.bbox(token.get("shape_id"))
-            if not bbox:
+            centre = self._token_centre_px(token)
+            if not centre:
                 continue
             nx, ny = self._rink_to_px(entry.get("mx", 0.0), entry.get("my", 0.0))
-            dx = nx - (bbox[0] + bbox[2]) / 2
-            dy = ny - (bbox[1] + bbox[3]) / 2
+            dx = nx - centre[0]
+            dy = ny - centre[1]
             for item in self._token_items(token) + list(token.get("text_ids", [])):
                 try:
                     self.canvas.move(item, dx, dy)
@@ -1238,8 +1610,8 @@ class FloorballTacticsApp:
         tk.Button(buttons, text="Cancel", command=window.destroy, **cfg).pack(side=tk.RIGHT)
         entry.bind("<Return>", accept)
         window.bind("<Escape>", lambda _e: window.destroy())
-        window.grab_set()
-        self.root.wait_window(window)
+        self._make_modal(window)
+        self._wait_modal(window)
         return result["text"] or None
 
     def place_text_canvas(self, x, y, text=None, size=None):
@@ -1470,6 +1842,8 @@ class FloorballTacticsApp:
             pass
         self.clipboard = []
         self.groups = []
+        # A whole rink again, goals and crosses included.
+        self.hidden_pitch_parts.clear()
 
         # _update_roster is the one place that rebuilds both teams from scratch, which
         # is exactly what is wanted here (and exactly why redraw_canvas must not call
@@ -1508,6 +1882,61 @@ class FloorballTacticsApp:
                                      "name": f"Step {len(self.animation_steps)}",
                                      "actions": [], "named": False})
         self.animation_playhead = len(self.animation_steps) - 1
+        self._refresh_animation_list()
+
+    def delete_animation_selection(self):
+        """Delete whatever the timeline has picked.
+
+        One button for both, because the tree holds both: a group row takes the whole
+        group with it, an action row takes only that action out of its group. With
+        nothing picked it falls back to the group the red marker is on, which is what
+        the button used to do on its own."""
+        tree = getattr(self, "anim_tree", None)
+        selection = tree.selection() if tree is not None else ()
+        item = selection[0] if selection else None
+        if item and tree.parent(item):
+            group_index = self._group_index_for(item)
+            try:
+                position = int(item.split("a")[-1])
+            except ValueError:
+                position = None
+            if group_index is not None and position is not None:
+                return self.delete_animation_action(group_index, position)
+        return self.delete_animation_step()
+
+    def delete_animation_action(self, group_index, position):
+        """Take one action out of a group, and its drawing off the board with it.
+
+        A move leaves nothing behind to delete -- where the players ended up is the
+        group's own snapshot -- but an arrow, a sign or a label is a thing on the rink,
+        and a timeline that still listed it after it was gone would be lying."""
+        if not (0 <= group_index < len(self.animation_steps)):
+            return
+        group = self.animation_steps[group_index]
+        actions = group.get("actions") or []
+        if not (0 <= position < len(actions)):
+            return
+        description = actions.pop(position)
+        if description.startswith("Remove "):
+            # The row *is* the removal, so taking the row out puts the mark back into
+            # the play rather than deleting anything.
+            name = description[len("Remove "):]
+            for cid, meta in list(self.drawn_items.items()):
+                if (meta.get("anim_remove_group") == group_index
+                        and self._drawn_label(cid) == name):
+                    meta.pop("anim_remove_group", None)
+            self.show_all_drawn_items()
+            self._refresh_animation_list()
+            return
+        for cid, meta in list(self.drawn_items.items()):
+            if (meta.get("anim_group") == group_index
+                    and meta.get("anim_action") == description):
+                try:
+                    self.canvas.delete(cid)
+                except Exception:
+                    pass
+                self.drawn_items.pop(cid, None)
+                self.board_images.pop(cid, None)
         self._refresh_animation_list()
 
     def delete_animation_step(self):
@@ -1914,7 +2343,7 @@ class FloorballTacticsApp:
                   **cfg).pack(side=tk.RIGHT)
         entry.bind("<Return>", accept)
         window.bind("<Escape>", lambda _e: window.destroy())
-        window.grab_set()
+        self._make_modal(window)
         return "break"
 
     def set_group_time(self, index, seconds):
@@ -1992,8 +2421,8 @@ class FloorballTacticsApp:
             to_index = self.animation_steps.index(to_step)
         except ValueError:
             to_index = None
-        if to_index is not None:
-            self._apply_drawn_for_frame(to_index, fraction)
+        if getattr(self, "_attached_origins", None) is None:
+            self._attached_origins = self._capture_attached_origins()
         start = self._step_positions(from_step)
         end = self._step_positions(to_step)
         for label, (sx, sy) in start.items():
@@ -2006,17 +2435,103 @@ class FloorballTacticsApp:
             token = self.tokens.get(sid) if sid else None
             if not token:
                 continue
-            box = self.canvas.bbox(token.get("shape_id"))
-            if not box:
+            centre = self._token_centre_px(token)
+            if not centre:
                 continue
             nx, ny = self._rink_to_px(mx, my)
-            dx = nx - (box[0] + box[2]) / 2
-            dy = ny - (box[1] + box[3]) / 2
+            dx = nx - centre[0]
+            dy = ny - centre[1]
             for item in self._token_items(token) + list(token.get("text_ids", [])):
                 try:
                     self.canvas.move(item, dx, dy)
                 except Exception:
                     pass
+
+        # Where every player finishes this group, so an arrow that is still being drawn
+        # can be laid out at its final length rather than sliding along behind them.
+        finals = {}
+        for label, (ex, ey) in end.items():
+            sid = self._get_sid_by_label(label)
+            if sid is not None:
+                finals[sid] = self._rink_to_px(ex, ey)
+
+        # The players have moved; the arrows snapped to them follow, and only then are
+        # the drawings brought in -- the reveal reads the geometry the tracking has
+        # just brought up to date.
+        self._track_attached_lines(to_index, finals)
+        if to_index is not None:
+            self._apply_drawn_for_frame(to_index, fraction)
+
+    def _capture_attached_origins(self):
+        """Where every arrow snapped to a player sits before playback moves anything.
+
+        Each frame is then worked out from the player's *total* travel since this
+        moment. Nudging the arrow by one frame's delta instead would fight the reveal,
+        which puts a drawing back to its recorded geometry on every frame, and the tip
+        would fall further behind the player the longer the group ran."""
+        origins = {}
+        seen = set()
+        for token in self.tokens.values():
+            if not isinstance(token, dict):
+                continue
+            sid = token.get("shape_id")
+            if sid is None or sid in seen:
+                continue
+            seen.add(sid)
+            box = self.canvas.bbox(sid)
+            if not box:
+                continue
+            centre = ((box[0] + box[2]) / 2.0, (box[1] + box[3]) / 2.0)
+            for at_end, key in ((False, "attached_lines_start"),
+                                (True, "attached_lines_end")):
+                for cid in token.get(key) or ():
+                    coords = self.canvas.coords(cid)
+                    if coords and len(coords) >= 4:
+                        origins.setdefault(cid, []).append(
+                            (sid, centre, at_end, list(coords)))
+        return origins
+
+    def _track_attached_lines(self, to_index=None, finals=None):
+        """Keep every attached arrow pointing at its player.
+
+        An arrow snapped to a player is aimed *at them*, so it has to stay aimed while
+        they run: on the board a plain drag deliberately lets go of the arrow -- that
+        is repositioning, not choreography -- but in the animation the tip must not be
+        left behind.
+
+        An arrow that is being drawn *in this group* is a different case. It is laid
+        out at the geometry it will finish with, so it grows from its final tail
+        position along its final path. Tracking it live instead made the whole arrow
+        slide across the rink as it grew, because both ends were moving at once."""
+        finals = finals or {}
+        for cid, entries in (getattr(self, "_attached_origins", None) or {}).items():
+            meta = self.drawn_items.get(cid)
+            if meta is None:
+                continue
+            being_drawn = to_index is not None and meta.get("anim_group") == to_index
+            for sid, centre, at_end, coords in entries:
+                token = self.tokens.get(sid)
+                box = self.canvas.bbox(sid) if token else None
+                if being_drawn and sid in finals:
+                    target = finals[sid]
+                elif box:
+                    target = ((box[0] + box[2]) / 2.0, (box[1] + box[3]) / 2.0)
+                else:
+                    continue
+                dx = target[0] - centre[0]
+                dy = target[1] - centre[1]
+                axis = self._drawing_axis(cid, centre)
+                if not axis:
+                    continue
+                moved = self._stretched_points(coords, axis[0], axis[1], dx, dy)
+                if moved is None:
+                    continue
+                try:
+                    self.canvas.coords(cid, *moved)
+                except Exception:
+                    continue
+                if meta.get("full_coords"):
+                    meta["full_coords"] = list(moved)
 
     def _apply_drawn_for_frame(self, to_index, fraction):
         """Arrows, boxes, signs and labels take part in the animation: anything drawn in
@@ -2025,6 +2540,16 @@ class FloorballTacticsApp:
         appearing."""
         for cid, meta in list(self.drawn_items.items()):
             group = meta.get("anim_group")
+            gone = meta.get("anim_remove_group")
+            if gone is not None and (to_index > gone
+                                     or (to_index == gone and fraction > 0)):
+                # Removed by Backspace: it stays on the board while the play is being
+                # built, and goes when the group that removes it comes up.
+                try:
+                    self.canvas.itemconfig(cid, state=tk.HIDDEN)
+                except Exception:
+                    pass
+                continue
             if group is None:
                 continue                      # drawn outside the animation: always on
             try:
@@ -2037,6 +2562,29 @@ class FloorballTacticsApp:
                     self._reveal_drawn_item(cid, meta, fraction)
             except Exception:
                 pass
+
+    def _sync_full_coords(self):
+        """Re-read the full geometry of every drawing that takes part in the animation.
+
+        full_coords is what playback draws a line back to once its group has fully
+        opened, and what a stopped board is restored to. It is captured when the
+        drawing is made, so anything that moved it afterwards -- a player dragging an
+        attached arrow along, a window resize re-projecting the board -- left it
+        describing a shape that no longer exists, and the next Play or Stop snapped
+        the arrow back to its old length. Called wherever the board settles, never
+        while the animation is running: mid-playback a line is deliberately part
+        drawn, and recording that would make the shortening permanent."""
+        if self.animation_job is not None or getattr(self, "_animation_cursor", None):
+            return
+        for cid, meta in list(self.drawn_items.items()):
+            if meta.get("anim_group") is None:
+                continue
+            try:
+                coords = self.canvas.coords(cid)
+            except Exception:
+                continue
+            if coords:
+                meta["full_coords"] = list(coords)
 
     def _restore_full_coords(self, cid, meta):
         full = meta.get("full_coords")
@@ -2060,6 +2608,7 @@ class FloorballTacticsApp:
         # Walk the line's own length and stop where the fraction falls, so a curve
         # follows its curve rather than its chord.
         points = [(full[i], full[i + 1]) for i in range(0, len(full) - 1, 2)]
+        points = self._curve_points(cid, points)
         spans = [math.hypot(b[0] - a[0], b[1] - a[1])
                  for a, b in zip(points, points[1:])]
         total = sum(spans)
@@ -2078,9 +2627,36 @@ class FloorballTacticsApp:
         if len(drawn) >= 2:
             self.canvas.coords(cid, *[value for point in drawn for value in point])
 
+    def _curve_points(self, cid, points):
+        """A bend as a run of points along the curve Tk actually draws.
+
+        A bend is stored as start, control, end -- three points. Revealing it along
+        those would draw a straight line to the control point and only then bend,
+        which is not how the arrow looks. Sampling the quadratic through the control
+        point gives the drawn shape, so it appears the way it was drawn."""
+        if len(points) != 3:
+            return points
+        try:
+            if not self.canvas.itemcget(cid, "smooth") in ("1", "true", "bezier"):
+                return points
+        except Exception:
+            return points
+        (x0, y0), (cx, cy), (x1, y1) = points
+        samples = []
+        steps = 24
+        for step in range(steps + 1):
+            t = step / steps
+            inv = 1.0 - t
+            samples.append((inv * inv * x0 + 2 * inv * t * cx + t * t * x1,
+                            inv * inv * y0 + 2 * inv * t * cy + t * t * y1))
+        return samples
+
     def show_all_drawn_items(self):
         """Put every drawing back on the board at full length -- what the rink looks
         like when the animation is not running."""
+        # The board is at rest, so the next run captures where the arrows are then,
+        # not where they were before this one.
+        self._attached_origins = None
         for cid, meta in list(self.drawn_items.items()):
             try:
                 self.canvas.itemconfig(cid, state=tk.NORMAL)
@@ -2152,51 +2728,280 @@ class FloorballTacticsApp:
         self.show_all_drawn_items()
         self._refresh_animation_list()
 
-    def export_animation_gif(self):
-        """Render the sequence to an animated GIF by walking the board through every
-        frame and capturing the canvas itself, so what is exported is what is on
-        screen."""
+    # What Export can write. A video needs a frame writer -- imageio if it is
+    # installed, otherwise OpenCV -- while the stills and the GIF only need Pillow and
+    # the canvas capture. The four-character code is what OpenCV wants for the codec.
+    VIDEO_FORMATS = {
+        "MP4":  (".mp4",  "mp4v"),
+        "WebM": (".webm", "VP80"),
+        "AVI":  (".avi",  "MJPG"),
+        "MOV":  (".mov",  "mp4v"),
+    }
+    IMAGE_FORMATS = {"PNG": ".png", "JPEG": ".jpg"}
+    MOTION_FORMATS = ("GIF",) + tuple(VIDEO_FORMATS)
+
+    def export_animation(self):
+        """The one Export entry point: pick a format, and for stills the groups to
+        save, then write them."""
+        window = tk.Toplevel(self.root)
+        window.title("Export")
+        window.transient(self.root)
+        window.configure(bg=self.C_PANEL)
+        window.resizable(False, False)
+
+        chosen = tk.StringVar(value="GIF")
+        body = tk.Frame(window, bg=self.C_PANEL)
+        body.pack(padx=14, pady=12, fill=tk.BOTH, expand=True)
+
+        left = tk.Frame(body, bg=self.C_PANEL)
+        left.pack(side=tk.LEFT, anchor="n", padx=(0, 18))
+        tk.Label(left, text="Format", bg=self.C_PANEL, fg=self.C_TEXT,
+                 font=(self.UI_FONT, 9, "bold")).pack(anchor="w")
+        tk.Label(left, text="Moving", bg=self.C_PANEL, fg=self.C_MUTED,
+                 font=(self.UI_FONT, 8)).pack(anchor="w", pady=(6, 0))
+        for name in self.MOTION_FORMATS:
+            tk.Radiobutton(left, text=name, value=name, variable=chosen,
+                           bg=self.C_PANEL, fg=self.C_TEXT, anchor="w",
+                           selectcolor=self.C_SURFACE,
+                           font=(self.UI_FONT, 9)).pack(anchor="w")
+        tk.Label(left, text="Still", bg=self.C_PANEL, fg=self.C_MUTED,
+                 font=(self.UI_FONT, 8)).pack(anchor="w", pady=(6, 0))
+        for name in self.IMAGE_FORMATS:
+            tk.Radiobutton(left, text=name, value=name, variable=chosen,
+                           bg=self.C_PANEL, fg=self.C_TEXT, anchor="w",
+                           selectcolor=self.C_SURFACE,
+                           font=(self.UI_FONT, 9)).pack(anchor="w")
+
+        right = tk.Frame(body, bg=self.C_PANEL)
+        right.pack(side=tk.LEFT, anchor="n", fill=tk.BOTH, expand=True)
+        tk.Label(right, text="Groups to save", bg=self.C_PANEL, fg=self.C_TEXT,
+                 font=(self.UI_FONT, 9, "bold")).pack(anchor="w")
+        hint = tk.Label(right, bg=self.C_PANEL, fg=self.C_MUTED, justify="left",
+                        font=(self.UI_FONT, 8), wraplength=230,
+                        text="A moving export always runs the whole sequence.")
+        hint.pack(anchor="w", pady=(2, 4))
+        listbox = tk.Listbox(right, selectmode=tk.EXTENDED, height=8, width=30,
+                             exportselection=False, font=(self.UI_FONT, 9))
+        listbox.pack(fill=tk.BOTH, expand=True)
+        names = self._group_export_names()
+        for index, name in enumerate(names):
+            listbox.insert(tk.END, name)
+        listbox.selection_set(0, tk.END)
+
+        def formats_changed(*_):
+            still = chosen.get() in self.IMAGE_FORMATS
+            listbox.config(state=tk.NORMAL if still else tk.DISABLED)
+            hint.config(text=("One image per group you pick."
+                              if still
+                              else "A moving export always runs the whole sequence."))
+        chosen.trace_add("write", formats_changed)
+        formats_changed()
+
+        result = {}
+
+        def go():
+            result["format"] = chosen.get()
+            result["groups"] = [int(i) for i in listbox.curselection()] or [0]
+            window.destroy()
+
+        buttons = tk.Frame(window, bg=self.C_PANEL)
+        buttons.pack(fill=tk.X, padx=14, pady=(0, 12))
+        tk.Button(buttons, text="Export", command=go, font=(self.UI_FONT, 9),
+                  relief=tk.FLAT, bg=self.C_ACCENT, fg=self.C_ACCENT_FG, bd=0,
+                  padx=14, pady=3).pack(side=tk.RIGHT, padx=(6, 0))
+        tk.Button(buttons, text="Cancel", command=window.destroy,
+                  font=(self.UI_FONT, 9), relief=tk.FLAT, bg=self.C_BTN,
+                  fg=self.C_TEXT, bd=0, padx=14, pady=3).pack(side=tk.RIGHT)
+
+        self._make_modal(window)
+        self._wait_modal(window)
+        if result:
+            self.run_export(result["format"], result["groups"])
+
+    def _group_export_names(self):
+        """One line per group for the export list, or the live board when there are no
+        groups yet -- a still of what is on screen is worth exporting either way."""
+        if not self.animation_steps:
+            return ["Board as it stands"]
+        return [f"{index}. {step.get('name') or f'Group {index}'}"
+                for index, step in enumerate(self.animation_steps)]
+
+    def run_export(self, fmt="GIF", groups=None):
+        """Write the export. Split from the dialog so it can be driven directly."""
+        if fmt in self.IMAGE_FORMATS:
+            # Not `groups or [0]`: an empty list is a caller saying "none", which is a
+            # thing to refuse rather than quietly turn into group 0.
+            return self._export_stills(fmt, [0] if groups is None else groups)
+        if fmt in self.MOTION_FORMATS:
+            return self._export_motion(fmt)
+        return False
+
+    def _export_motion(self, fmt):
+        """The whole sequence, as a GIF or a video."""
         problem = self._animation_problem()
         if problem:
             messagebox.showwarning(*problem)
-            return
-        path = filedialog.asksaveasfilename(defaultextension=".gif",
-                                            filetypes=[("GIF", "*.gif")])
+            return False
+        extension = ".gif" if fmt == "GIF" else self.VIDEO_FORMATS[fmt][0]
+        path = filedialog.asksaveasfilename(
+            defaultextension=extension,
+            filetypes=[(fmt, f"*{extension}")])
         if not path:
-            return
+            return False
 
         self.pause_animation()
         restore = self._board_snapshot()
-        frames, frame_ms = [], int(1000 / self.ANIMATION_FPS)
         try:
-            for index in range(len(self.animation_steps) - 1):
-                step = self.animation_steps[index + 1]
-                count = max(1, int(round(float(step.get("duration", 1.0))
-                                         * self.ANIMATION_FPS)))
-                for frame in range(count):
-                    self._apply_animation_frame(self.animation_steps[index], step,
-                                                (frame + 1) / count)
-                    self.canvas.update()
-                    captured = self._capture_canvas()
-                    if captured is None:
-                        messagebox.showerror(
-                            "Export failed",
-                            "The board could not be captured. Exporting a GIF needs "
-                            "Ghostscript installed (the 'gs' command).")
-                        return
-                    frames.append(captured)
+            frames = self._render_animation_frames()
+            if frames is None:
+                return False
             if not frames:
                 messagebox.showwarning("Nothing to export", "No frames were produced.")
-                return
-            frames[0].save(path, save_all=True, append_images=frames[1:],
-                           duration=frame_ms, loop=0, optimize=True)
+                return False
+            if fmt == "GIF":
+                frames[0].save(path, save_all=True, append_images=frames[1:],
+                               duration=int(1000 / self.ANIMATION_FPS), loop=0,
+                               optimize=True)
+            elif not self._write_video(path, frames, self.VIDEO_FORMATS[fmt][1]):
+                return False
             messagebox.showinfo(
                 "Exported",
                 f"Saved {len(frames)} frames to\n{path}\n\n"
                 "Note: a watermark image is not included -- the canvas capture Tk "
                 "provides covers shapes and text only.")
+            return True
         except Exception as error:
-            messagebox.showerror("Export failed", f"Could not write the GIF:\n{error}")
+            messagebox.showerror("Export failed", f"Could not write the {fmt}:\n{error}")
+            return False
+        finally:
+            self._restore_board(restore)
+            self.show_all_drawn_items()
+            self.canvas.update()
+
+    def _render_animation_frames(self):
+        """Walk the board through the whole sequence, capturing every frame.
+
+        None means the board could not be captured at all, which is a different thing
+        from a sequence that produced no frames."""
+        frames = []
+        for index in range(len(self.animation_steps) - 1):
+            step = self.animation_steps[index + 1]
+            count = max(1, int(round(float(step.get("duration", 1.0))
+                                     * self.ANIMATION_FPS)))
+            for frame in range(count):
+                self._apply_animation_frame(self.animation_steps[index], step,
+                                            (frame + 1) / count)
+                self.canvas.update()
+                captured = self._capture_canvas()
+                if captured is None:
+                    messagebox.showerror(
+                        "Export failed",
+                        "The board could not be captured. Exporting needs Ghostscript "
+                        "installed (the 'gs' command).")
+                    return None
+                frames.append(captured)
+        return frames
+
+    def _write_video(self, path, frames, codec):
+        """Frames to a video file, through whichever writer this machine has.
+
+        imageio first because it names codecs rather than four-character tags, then
+        OpenCV, which ships its own FFmpeg on most installs. Neither is a dependency
+        of the application: without them the GIF and the stills still work."""
+        size = (frames[0].width, frames[0].height)
+        try:
+            import imageio.v2 as imageio            # noqa: PLC0415
+        except Exception:
+            imageio = None
+        if imageio is not None:
+            try:
+                with imageio.get_writer(path, fps=self.ANIMATION_FPS) as writer:
+                    for frame in frames:
+                        writer.append_data(self._frame_array(frame))
+                return True
+            except Exception:
+                pass                                # fall through to OpenCV
+        try:
+            import cv2                              # noqa: PLC0415
+        except Exception:
+            messagebox.showerror(
+                "Export failed",
+                "Writing a video needs either imageio or OpenCV.\n\n"
+                "Install one of them:\n"
+                "    pip install imageio imageio-ffmpeg\n"
+                "    pip install opencv-python\n\n"
+                "GIF, PNG and JPEG export work without either.")
+            return False
+        writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*codec),
+                                 self.ANIMATION_FPS, size)
+        if not writer.isOpened():
+            writer.release()
+            messagebox.showerror(
+                "Export failed",
+                f"This machine's video encoder would not open a {codec} stream.\n\n"
+                "Try another format, or export a GIF.")
+            return False
+        for frame in frames:
+            # PIL is RGB, OpenCV wants BGR.
+            writer.write(self._frame_array(frame)[:, :, ::-1])
+        writer.release()
+        return True
+
+    @staticmethod
+    def _frame_array(image):
+        """A captured frame as the array both video writers expect. numpy is imported
+        here rather than at the top: nothing else in the application needs it."""
+        import numpy                                # noqa: PLC0415
+        return numpy.asarray(image.convert("RGB"))
+
+    def _export_stills(self, fmt, groups):
+        """One image per chosen group: the board as it stands when that group is done."""
+        extension = self.IMAGE_FORMATS[fmt]
+        wanted = sorted({index for index in groups
+                         if 0 <= index < max(1, len(self.animation_steps))})
+        if not wanted:
+            messagebox.showwarning("Nothing to export", "Pick at least one group.")
+            return False
+        path = filedialog.asksaveasfilename(defaultextension=extension,
+                                            filetypes=[(fmt, f"*{extension}")])
+        if not path:
+            return False
+
+        stem, _ = os.path.splitext(path)
+        self.pause_animation()
+        restore = self._board_snapshot()
+        written = []
+        try:
+            for index in wanted:
+                if self.animation_steps:
+                    step = self.animation_steps[index]
+                    self._apply_animation_frame(self.animation_steps[max(index - 1, 0)],
+                                                step, 1.0)
+                self.canvas.update()
+                captured = self._capture_canvas()
+                if captured is None:
+                    messagebox.showerror(
+                        "Export failed",
+                        "The board could not be captured. Exporting needs Ghostscript "
+                        "installed (the 'gs' command).")
+                    return False
+                # One group keeps the name that was typed; several are numbered, so a
+                # sequence of stills lands in order in the folder.
+                target = path if len(wanted) == 1 else f"{stem}_{index:02d}{extension}"
+                if fmt == "JPEG":
+                    captured = captured.convert("RGB")
+                captured.save(target, fmt)
+                written.append(target)
+            messagebox.showinfo(
+                "Exported",
+                f"Saved {len(written)} image(s):\n" + "\n".join(written[:8]) +
+                ("\n..." if len(written) > 8 else "") +
+                "\n\nNote: a watermark image is not included -- the canvas capture Tk "
+                "provides covers shapes and text only.")
+            return True
+        except Exception as error:
+            messagebox.showerror("Export failed", f"Could not write the image:\n{error}")
+            return False
         finally:
             self._restore_board(restore)
             self.show_all_drawn_items()
@@ -2218,13 +3023,86 @@ class FloorballTacticsApp:
         except Exception:
             return None
 
+    def _compact_commands(self, records):
+        """Drop instructions that no longer say anything, and merge the ones that
+        repeat. Returns the shortened list and how many entries went.
+
+        `records` pairs each serialised instruction with the animation group it was
+        recorded in. The group is what makes this safe: two identical instructions in
+        different groups are two moments of the play, while two in the same group are
+        one moment recorded twice, and only the last of them was ever seen.
+
+        Three things go:
+          * a formation superseded by a later formation for the same team in the
+            same group -- applying the first was undone by the second before anyone
+            saw it;
+          * moves of players that have since been taken off the board, which replay
+            as no-ops;
+          * consecutive moves within one group, which are folded into a single
+            displacement per player."""
+        live = {token.get("label") for token in self.tokens.values()}
+        kept = []
+        for entry, group in records:
+            entry = dict(entry)
+            if entry.get("type") == "move_tokens":
+                moves = {label: delta
+                         for label, delta in (entry.get("moves") or {}).items()
+                         if label in live}
+                if not moves:
+                    continue                    # every player in it has gone
+                entry["moves"] = moves
+            kept.append([entry, group])
+
+        # A later formation for the same team in the same group wins.
+        seen_tactics = set()
+        survivors = []
+        for entry, group in reversed(kept):
+            if entry.get("type") == "tactic":
+                key = (group, entry.get("team"))
+                if key in seen_tactics:
+                    continue
+                seen_tactics.add(key)
+            survivors.append([entry, group])
+        survivors.reverse()
+
+        # Consecutive moves in one group are one move.
+        merged = []
+        for entry, group in survivors:
+            if (merged and entry.get("type") == "move_tokens"
+                    and merged[-1][0].get("type") == "move_tokens"
+                    and merged[-1][1] == group):
+                target = merged[-1][0]["moves"]
+                for label, (dx, dy) in entry["moves"].items():
+                    old_dx, old_dy = target.get(label, (0, 0))
+                    target[label] = (old_dx + dx, old_dy + dy)
+                continue
+            merged.append([entry, group])
+
+        return [entry for entry, _ in merged], len(records) - len(merged)
+
     def save_macro(self):
         if not self.undo_stack and not self.tokens:
             messagebox.showinfo("Empty", "Nothing on the board to save.")
             return
         filepath = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("JSON Files", "*.json")])
         if filepath:
-            commands = [cmd.serialize() for cmd in self.undo_stack if hasattr(cmd, "serialize")]
+            records = [(cmd.serialize(), getattr(cmd, "animation_group", 0))
+                       for cmd in self.undo_stack if hasattr(cmd, "serialize")]
+            commands = [entry for entry, _ in records]
+            # Offered, never imposed: a recording is a log of what was done, and some
+            # people want it kept that way. The question is only asked when there is
+            # something to gain.
+            tidied, removed = self._compact_commands(records)
+            if removed and messagebox.askyesno(
+                    "Tidy the recording?",
+                    f"{removed} of the {len(commands)} recorded instructions are "
+                    "superseded by later ones in the same animation group, or refer "
+                    "to players that are no longer on the board.\n\n"
+                    "Leave them out of the file?\n\n"
+                    "The play is saved either way. The command log is history, not "
+                    "what the file is rebuilt from, so tidying it cannot change what "
+                    "comes back -- it only makes the record easier to read."):
+                commands = tidied
             board = self._board_snapshot()
             # A watermark entry embeds the whole image, so only the last one is kept --
             # the earlier ones are superseded anyway -- and the board's copy is dropped
@@ -2237,7 +3115,24 @@ class FloorballTacticsApp:
                 commands = [entry for i, entry in enumerate(commands)
                             if entry.get("type") != "watermark" or i == keep]
                 board.pop("watermark", None)
-            data = {"version": 2, "commands": commands, "board": board}
+            # Version 3 is the play itself, not a recipe for re-enacting it: where
+            # every mark sits in rink metres, the whole timeline with each group's
+            # duration and the second it starts at, and the board each group ends on.
+            # The command log is kept alongside it as the history of how the play was
+            # built -- but nothing about reopening the file depends on replaying it any
+            # more, which is what used to scatter the arrows and collapse every group
+            # into one.
+            order = list(self.drawn_items)
+            data = {
+                "version": 3,
+                "app": "Floorball Tactics Studio",
+                "saved_at": datetime.datetime.now().isoformat(timespec="seconds"),
+                "board": board,
+                "drawings": self._drawings_snapshot(),
+                "attachments": self._attachments_snapshot(order),
+                "animation": self._animation_snapshot(),
+                "commands": commands,
+            }
             with open(filepath, "w") as f:
                 json.dump(data, f, indent=4)
             messagebox.showinfo("Success", "Macro saved successfully!")
@@ -2250,11 +3145,16 @@ class FloorballTacticsApp:
             with open(filepath, "r") as f:
                 data = json.load(f)
 
-            # Version 1 files were a bare list of commands; version 2 adds the board.
+            # Version 1 files were a bare list of commands; version 2 adds the board;
+            # version 3 adds the drawings and the timeline, and is loaded from those
+            # rather than by replaying anything.
             if isinstance(data, dict):
                 commands, board = data.get("commands", []), data.get("board")
             else:
                 commands, board = data, None
+
+            if isinstance(data, dict) and int(data.get("version", 0)) >= 3:
+                return self._load_play(data)
 
             for cmd_data in commands:
                 ctype = cmd_data.get("type")
@@ -2277,6 +3177,16 @@ class FloorballTacticsApp:
                 elif ctype == "watermark":
                     self.push_command(SetWatermarkCommand(
                         self, cmd_data.get("watermark"), self._watermark_snapshot()))
+                elif ctype == "delete_tokens":
+                    for spec in cmd_data.get("players", []):
+                        sid = self._get_sid_by_label(spec.get("label"))
+                        token = self.tokens.get(sid) if sid else None
+                        if token:
+                            self._delete_token(token)
+                    self._refresh_roster_counts()
+                elif ctype == "pitch_parts":
+                    self.push_command(HidePitchPartsCommand(
+                        self, cmd_data.get("keys", []), cmd_data.get("hide", True)))
 
             # Applied last so the recorded positions win over anything the replayed
             # commands did with their pixel deltas.
@@ -2285,6 +3195,47 @@ class FloorballTacticsApp:
 
         except Exception as e:
             messagebox.showerror("Error", f"Failed to load macro:\n{e}")
+
+    def _load_play(self, data):
+        """Open a version 3 file: the board, the marks, the timeline, as saved.
+
+        Nothing is replayed. The command log in the file is history, kept so a play
+        can still be read as a list of what was done, but the play that comes back is
+        the one that was saved -- same positions, same arrows, same groups, same
+        times."""
+        try:
+            self.stop_animation()
+        except Exception:
+            pass
+        self.undo_stack.clear()
+        self.redo_stack.clear()
+        self.action_steps.clear()
+        try:
+            self.steps_listbox.delete(0, tk.END)
+        except Exception:
+            pass
+        self.animation_steps = []
+        self.animation_playhead = 0
+
+        board = data.get("board") or {}
+        # The rink first: the metres in the file describe positions on that field.
+        if board:
+            self._restore_board(board)
+        restored = self._restore_drawings(data.get("drawings") or [])
+        self._restore_attachments(data.get("attachments") or {}, restored)
+        self._restore_animation(data.get("animation") or {})
+        for entry in data.get("commands") or ():
+            description = entry.get("type")
+            if description:
+                self.action_steps.append(str(description))
+                try:
+                    self.steps_listbox.insert(tk.END, str(description))
+                except Exception:
+                    pass
+        self.show_all_drawn_items()
+        self._refresh_animation_list()
+        self._update_indicators()
+        return True
 
     # ----------------------
     # UI / icons
@@ -2334,7 +3285,7 @@ class FloorballTacticsApp:
         elif st_lower == "x":
             draw.line([4, 4, 20, 16], fill="black", width=2)
             draw.line([4, 16, 20, 4], fill="black", width=2)
-        elif st_lower == "dot" or st_lower == "circle":
+        elif st_lower in ("ball", "dot", "circle"):
             draw.ellipse([8, 6, 16, 14], fill="black", outline="black")
         elif st_lower == "square":
             draw.rectangle([4, 2, 20, 18], outline="black", width=2)
@@ -2414,6 +3365,10 @@ class FloorballTacticsApp:
         view_menu = tk.Menu(menubar, tearoff=0)
         view_menu.add_command(label="Rotate Rink Horizontal", command=lambda: self.rotate_rink("horizontal"))
         view_menu.add_command(label="Rotate Rink Vertical", command=lambda: self.rotate_rink("vertical"))
+        view_menu.add_separator()
+        view_menu.add_command(label="Zoom In\tCtrl +", command=self.zoom_in)
+        view_menu.add_command(label="Zoom Out\tCtrl -", command=self.zoom_out)
+        view_menu.add_command(label="Reset Zoom\tCtrl 0", command=self.zoom_reset)
         menubar.add_cascade(label="View", menu=view_menu)
 
         menu_menu = tk.Menu(menubar, tearoff=0)
@@ -2500,20 +3455,30 @@ class FloorballTacticsApp:
             if name == "rotate_rink":
                 self.toggle_rink_orientation()
                 return
+            if name == "rink_mode":
+                # Not a toggle but a rotation through the three fields, which is why
+                # it is the one button here that carries no on/off highlight.
+                self.cycle_rink_mode()
+                return
+            if name == "half_rink":
+                # A toggle, but one that has to redraw the board rather than only
+                # relight itself, because it changes how much rink there is.
+                self.toggle_half_rink()
+                return
             var.set(not var.get())
             if name == "ghosting" and not var.get():
                 # Switching ghosting off with trails all over the rink and no way to
                 # sweep them up was the awkward part: off now means gone.
                 self.clear_ghosts()
             self._update_indicators()
-            if name == "half_rink" or name == "goals":
+            if name == "goals":
                 self.redraw_canvas()
             elif name == "grid":
                 self.toggle_grid_visuals()
 
         settings_list = [
-            ("Half", self.half_rink_var, "half_rink"),
-            ("Arches", self.curved_arches_var, "arches"),
+            (self.RINK_BUTTON_LABELS[self.rink_mode], None, "rink_mode"),
+            ("Rink: Half", self.half_rink_var, "half_rink"),
             ("Goals", self.goals_visible_var, "goals"),
             ("Snap Plr", self.snap_player_var, "snap_player"),
             ("Snap Ang", self.snap_angle_var, "snap_angle"),
@@ -2528,8 +3493,8 @@ class FloorballTacticsApp:
         # all render at one length while asking for less.
         setting_btn_cfg = {k: v for k, v in gray_btn_cfg.items() if k != "width"}
 
-        # Eight toggles fill a 2x4 grid exactly: no spans, no empty cells, and the
-        # uniform equal-weight columns give every button the same length.
+        # A 2x4 grid: the uniform equal-weight columns give every button the same
+        # length whether or not the last cell is filled.
         for idx, (label_txt, var_ref, name_key) in enumerate(settings_list):
             r, c = divmod(idx, 4)
             btn = tk.Button(setting_grid, text=label_txt, command=lambda v=var_ref, k=name_key: toggle_setting(v, k), **setting_btn_cfg)
@@ -2853,7 +3818,7 @@ class FloorballTacticsApp:
                 ("Pause", self.pause_animation),
                 ("Stop", self.stop_animation),
                 ("Add Group", self.add_animation_step),
-                ("Del Group", self.delete_animation_step),
+                ("Delete", self.delete_animation_selection),
                 ("Up", lambda: self.move_animation_step(-1)),
                 ("Down", lambda: self.move_animation_step(1)))):
             button = tk.Button(anim_buttons, text=label, command=command, **transport_cfg)
@@ -2874,7 +3839,7 @@ class FloorballTacticsApp:
         tk.Button(g_grid, text="Undo", command=self.undo, **general_btn_cfg).grid(row=0, column=0, padx=3, pady=2, sticky="ew")
         tk.Button(g_grid, text="Redo", command=self.redo, **general_btn_cfg).grid(row=0, column=1, padx=3, pady=2, sticky="ew")
         tk.Button(g_grid, text="Save", command=self.save_macro, **general_btn_cfg).grid(row=0, column=2, padx=3, pady=2, sticky="ew")
-        tk.Button(g_grid, text="Export", command=self.export_animation_gif, **general_btn_cfg).grid(row=0, column=3, padx=3, pady=2, sticky="ew")
+        tk.Button(g_grid, text="Export", command=self.export_animation, **general_btn_cfg).grid(row=0, column=3, padx=3, pady=2, sticky="ew")
         tk.Button(g_grid, text="Load", command=self.load_macro, **general_btn_cfg).grid(row=1, column=0, padx=3, pady=2, sticky="ew")
         tk.Button(g_grid, text="Watermark", command=self.add_watermark, **general_btn_cfg).grid(row=1, column=1, padx=3, pady=2, sticky="ew")
         tk.Button(g_grid, text="Reset", command=self.reset_board, **general_btn_cfg).grid(row=1, column=2, padx=3, pady=2, sticky="ew")
@@ -2894,6 +3859,17 @@ class FloorballTacticsApp:
         self.canvas.bind("<ButtonRelease-1>", self.on_canvas_release)
         self.canvas.bind("<Button-3>", self.show_context_menu)
         self.canvas.bind("<Configure>", self.on_canvas_resize)
+        # The wheel: X11 sends buttons 4/5 up and down and 6/7 sideways, everything
+        # else sends <MouseWheel> with a delta. Shift turns a vertical wheel sideways.
+        # Buttons 6 and 7 are the horizontal wheel; older Tk builds refuse to bind
+        # them at all, so every sequence is tried on its own and a refusal is fine.
+        for sequence in ("<MouseWheel>", "<Shift-MouseWheel>",
+                         "<Button-4>", "<Button-5>", "<Button-6>", "<Button-7>",
+                         "<Shift-Button-4>", "<Shift-Button-5>"):
+            try:
+                self.canvas.bind(sequence, self._on_mouse_wheel)
+            except Exception:
+                pass
         self.root.bind("<Configure>", self.on_window_resize)
 
         self._update_indicators()
@@ -2915,7 +3891,8 @@ class FloorballTacticsApp:
         "Watermark": "Load a logo onto the rink, then place, crop and fade it in the "
                      "editor that opens.",
         "Prefs": "Preferences: default colours, sizes and board options.",
-        "Export": "Export the animation as an animated GIF.",
+        "Export": "Export the play: GIF, MP4, WebM, AVI or MOV, or a PNG/JPEG of "
+                  "whichever groups you pick.",
         "Reset": "Clear the board back to the starting formations, with no drawings, "
                  "watermark, timeline or animation steps. Asks first.",
         # Animation transport
@@ -2924,13 +3901,16 @@ class FloorballTacticsApp:
         "Play": "Play the animation from the red group.",
         "Pause": "Pause where it is. Play carries on from the same point.",
         "Stop": "Stop and return to group 0.",
-        "Del Group": "Delete the group the red marker is on.",
+        "Delete": "Delete what is picked in the timeline: a group with everything in "
+                  "it, or a single action out of its group.",
         "Up": "Move the selected group one place earlier in the sequence.",
         "Down": "Move the selected group one place later in the sequence.",
         # Board settings
-        "Full": "Switch to the half rink.",
-        "Half": "Switch back to the full rink.",
-        "Arches": "Show or hide the rounded corner arches.",
+        "Rink: 5v5": "Large field, 40 x 20 m, five a side. Click for 4v4.",
+        "Rink: 4v4": "Small field, 27 x 15 m, four a side. Click for 3v3.",
+        "Rink: 3v3": "3v3 field, 22 x 11 m, three a side. Click for 5v5.",
+        "Rink: Half": "Draw one end of the field instead of all of it. Works on "
+                      "every field, and leaves the number of players alone.",
         "Goals": "Show or hide the goals.",
         "Snap Plr": "Snap line ends and the ball onto nearby players.",
         "Snap Ang": "Snap drawn lines to 45 degree angles.",
@@ -2965,7 +3945,8 @@ class FloorballTacticsApp:
         "Dribble": "Draw a dribble: a wavy run with the ball.",
         "Run": "Draw a run without the ball.",
         "Line": "Draw a plain straight line.",
-        "Bend": "Draw a curve: click the start, the bend, then the end.",
+        "Bend": "Draw a curve: click the start, the bend, then the end. It takes the "
+                "line type that is armed, so a pass, shot, dribble or run can be bent.",
         "Box": "Draw a square outline.",
         "Rect": "Draw a rectangle outline.",
         "Circle": "Draw a circle.",
@@ -2996,9 +3977,10 @@ class FloorballTacticsApp:
             for child in parent.winfo_children():
                 if isinstance(child, (tk.Button, tk.Checkbutton)):
                     label = child.cget("text")
-                    if label in ("Full", "Half"):
-                        # This one relabels itself as the rink is toggled, so the
-                        # caption is looked up when it is shown, not when it is bound.
+                    if label.startswith("Rink: "):
+                        # The field button relabels itself as the rink is cycled, so
+                        # the caption is looked up when it is shown, not when it is
+                        # bound. Rink: Half is looked up the same way for free.
                         Tooltip(child, lambda w=child: self.BUTTON_TOOLTIPS.get(w.cget("text")),
                                 font=(self.UI_FONT, 8))
                     elif self.BUTTON_TOOLTIPS.get(label):
@@ -3010,7 +3992,12 @@ class FloorballTacticsApp:
     def _update_indicators(self):
         for name, btn in self.tool_buttons.items():
             try:
-                if name == self.active_tool:
+                # No active tool *is* the select tool: with nothing else armed the
+                # board is in select-and-move mode, so Select lights up like any other
+                # tool rather than being the one that never looks chosen.
+                active = (name == self.active_tool
+                          or (name == "select" and self.active_tool is None))
+                if active:
                     btn.config(bg=self.C_ACCENT, fg=self.C_ACCENT_FG)
                 else:
                     btn.config(bg=self.C_BTN, fg=self.C_TEXT)
@@ -3020,7 +4007,6 @@ class FloorballTacticsApp:
         for name, btn in self.setting_buttons.items():
             var_map = {
                 "half_rink": self.half_rink_var,
-                "arches": self.curved_arches_var,
                 "goals": self.goals_visible_var,
                 "snap_player": self.snap_player_var,
                 "snap_angle": self.snap_angle_var,
@@ -3028,9 +4014,11 @@ class FloorballTacticsApp:
                 "ghosting": self.ghosting_var
             }
             is_active = bool(name in var_map and var_map[name].get())
-            if name == "half_rink":
+            if name == "rink_mode":
+                # The label is the field you are on, and the tooltip says what the
+                # next click switches to.
                 try:
-                    btn.config(text="Half" if self.half_rink_var.get() else "Full")
+                    btn.config(text=self.RINK_BUTTON_LABELS[self.rink_mode])
                 except Exception:
                     pass
             if is_active:
@@ -3475,8 +4463,8 @@ class FloorballTacticsApp:
             "att": "#009e73", "def": "#cc79a7", "line": "#000000", "sign": "#000000",
             "note": "Okabe-Ito. Works for blue-yellow colour blindness too."},
         "Nijmegen Flames": {
-            "att": "#e8262b", "def": "#4c4c4e", "line": "#4c4c4e", "sign": "#f5c518",
-            "note": "Club colours: the crest's red and slate, with its yellow for marks."},
+            "att": "#e8262b", "def": "#4c4c4e", "line": "#000000", "sign": "#000000",
+            "note": "Club colours on the players only; arrows and marks stay black."},
         "Nijmegen Hot Shots": {
             "att": "#e8262b", "def": "#111111", "line": "#111111", "sign": "#e8262b",
             "note": "Club colours: the logo's red on black."},
@@ -3533,8 +4521,8 @@ class FloorballTacticsApp:
     def _settings_snapshot(self):
         """Everything the Preferences dialog can change, as it stands right now."""
         return {
-            "half_rink": bool(self.half_rink_var.get()),
-            "arches": bool(self.curved_arches_var.get()),
+            "rink_mode": self.rink_mode,
+            "half_rink": self.half_rink,
             "goals": bool(self.goals_visible_var.get()),
             "snap_player": bool(self.snap_player_var.get()),
             "snap_angle": bool(self.snap_angle_var.get()),
@@ -3553,9 +4541,9 @@ class FloorballTacticsApp:
         """Put the board back the way `_settings_snapshot` found it."""
         if not snapshot:
             return
-        for name, variable in (("half_rink", self.half_rink_var),
-                               ("arches", self.curved_arches_var),
-                               ("goals", self.goals_visible_var),
+        self.set_rink_mode(snapshot["rink_mode"],
+                           half=snapshot.get("half_rink", self.half_rink))
+        for name, variable in (("goals", self.goals_visible_var),
                                ("snap_player", self.snap_player_var),
                                ("snap_angle", self.snap_angle_var),
                                ("grid", self.grid_var),
@@ -3600,9 +4588,27 @@ class FloorballTacticsApp:
             return row + 1
 
         row = heading("Board", 0)
-        for text, var in (("Half rink", self.half_rink_var),
-                          ("Curved arches", self.curved_arches_var),
-                          ("Show goals", self.goals_visible_var),
+        # The rink is a choice of three fields rather than a switch, so it gets a row
+        # of radio buttons instead of a checkbox. The half rink is a separate
+        # question -- every field has a half -- so it is a checkbox beside them.
+        rink_row = tk.Frame(win)
+        rink_row.grid(row=row, column=0, columnspan=2, sticky="w", padx=18)
+        tk.Label(rink_row, text="Rink").pack(side=tk.LEFT, padx=(0, 6))
+        for mode in self.RINK_ORDER:
+            length, width = self.RINK_SIZES[mode]
+            tk.Radiobutton(rink_row, text=f"{self.RINK_LABELS[mode]} "
+                                          f"({length:g}×{width:g} m)",
+                           value=mode, variable=self.rink_mode_var,
+                           command=lambda m=mode: self.set_rink_mode(m)).pack(side=tk.LEFT)
+        row += 1
+        # The variable is already flipped by the time the command runs, so the new
+        # state is read back off it rather than being worked out here.
+        tk.Checkbutton(win, text="Half rink (one end of the field)",
+                       variable=self.half_rink_var, anchor="w",
+                       command=lambda: self.set_half_rink(self.half_rink_var.get())).grid(
+            row=row, column=0, columnspan=2, sticky="w", padx=18)
+        row += 1
+        for text, var in (("Show goals", self.goals_visible_var),
                           ("Snap players", self.snap_player_var),
                           ("Snap angles", self.snap_angle_var),
                           ("Snap to grid", self.grid_var),
@@ -4137,6 +5143,114 @@ class FloorballTacticsApp:
             x2, y2 = self.get_snap_point(x2, y2)
         return x1, y1, x2, y2
         
+    def move_attached_line_ends(self, token, dx, dy):
+        """Carry the ends of any arrows snapped to this player along with it.
+
+        Nudging the item's first or last coordinate pair is right for a plain
+        two-point line and wrong for everything else the tools draw. A shot's head is
+        a polygon whose last coordinate is a base corner, so dragging that one corner
+        folded the head up and the arrow came out shorter than the player had moved;
+        a dribble is one long polyline whose final segment stretched on its own while
+        the rest of the wave stayed where it was. Here every point is weighted by how
+        far along the arrow it lies, so the drawing follows the player as a whole
+        while its far end stays put."""
+        if not isinstance(token, dict):
+            return
+        # Where the player is now: the end of an arrow nearest to that is the end that
+        # is attached to them.
+        near = self._token_centre_px(token)
+        if not near:
+            return
+        for key in ("attached_lines_start", "attached_lines_end"):
+            ids = token.get(key)
+            if not ids:
+                continue
+            live = []
+            for cid in list(ids):
+                if self._stretch_attached_end(cid, dx, dy, near):
+                    live.append(cid)
+            # Ids of arrows that have since been deleted are dropped rather than
+            # carried forever.
+            token[key] = live
+
+    def _stretch_attached_end(self, cid, dx, dy, near):
+        """Move one drawing's attached end. False if the item is no longer there."""
+        try:
+            coords = list(self.canvas.coords(cid))
+        except Exception:
+            return False
+        if len(coords) < 4:
+            return bool(coords)
+        axis = self._drawing_axis(cid, near)
+        if not axis:
+            return True
+        moved = self._stretched_points(coords, axis[0], axis[1], dx, dy)
+        if moved is None:
+            return True
+        self.canvas.coords(cid, *moved)
+        return True
+
+    def _drawing_axis(self, cid, near):
+        """The line an arrow runs along, and which end of it is the attached one.
+
+        Measured from the drawing as it stands, not from the record the tool drew it
+        from. That record is in pixels from the moment of drawing, and a window
+        resize, a change of field or a zoom moves the arrow without touching it -- so
+        the weighting was computed against a line that was no longer there, every
+        point came out at the same weight, and the whole arrow jumped along with the
+        player instead of stretching from its far end. Which end is attached is
+        decided by which end is nearer the player, which needs no record at all."""
+        best, span = None, -1.0
+        for other in self._drawn_siblings(cid):
+            try:
+                points = self.canvas.coords(other)
+            except Exception:
+                continue
+            if not points or len(points) < 4:
+                continue
+            start, end = (points[0], points[1]), (points[-2], points[-1])
+            length = math.hypot(end[0] - start[0], end[1] - start[1])
+            if length > span:
+                best, span = (start, end), length
+        if not best:
+            return None
+        start, end = best
+        to_start = math.hypot(start[0] - near[0], start[1] - near[1])
+        to_end = math.hypot(end[0] - near[0], end[1] - near[1])
+        # anchor stays put, head follows the player.
+        return (end, start) if to_start <= to_end else (start, end)
+
+    def _stretched_points(self, coords, anchor, head, dx, dy):
+        """One drawing's points with its attached end moved by (dx, dy).
+
+        Shared by the two callers so a hand drag and the animation agree on what
+        "the arrow follows the player" means."""
+        if len(coords) < 4 or not anchor or not head:
+            return None
+        vx, vy = head[0] - anchor[0], head[1] - anchor[1]
+        span2 = vx * vx + vy * vy
+
+        def weight(px, py):
+            if span2 <= 0:
+                return 1.0
+            w = ((px - anchor[0]) * vx + (py - anchor[1]) * vy) / span2
+            return min(1.0, max(0.0, w))
+
+        points = [(coords[i], coords[i + 1]) for i in range(0, len(coords) - 1, 2)]
+        weights = [weight(px, py) for px, py in points]
+        lo, hi = min(weights), max(weights)
+        if hi - lo < 0.5:
+            # A compact piece -- an arrowhead -- is rigidly fixed to the tip of the
+            # shaft, not something to stretch: it travels as one, by the weight of
+            # whichever of its corners sits nearest the end being moved.
+            weights = [hi] * len(weights)
+        else:
+            # The body of the arrow: the far end stays, the attached end moves the
+            # whole way, everything between follows in proportion.
+            weights = [(w - lo) / (hi - lo) for w in weights]
+        return [value for (px, py), w in zip(points, weights)
+                for value in (px + dx * w, py + dy * w)]
+
     def get_token_at_point(self, x, y, radius=20):
         def _matches(token):
             if "shape_id" not in token:
@@ -4261,20 +5375,12 @@ class FloorballTacticsApp:
             id2 = self.canvas.create_line(x-s, y+s, x+s, y-s, fill=color, width=2, tags=("sign",))
             created.extend([id1, id2])
         elif sign_lower in ("ball", "dot", "circle"):
-            # A floorball, not a plain dot: the body plus the ring of holes that makes
-            # it read as a ball at a glance. ("dot"/"circle" still land here so macros
+            # A plain filled dot. It used to be drawn as a floorball, with a ring of
+            # holes punched in it, which at the size a ball is actually stamped read as
+            # a smudge rather than as a ball. ("dot"/"circle" land here too, so macros
             # saved before the rename keep working.)
             id1 = self.canvas.create_oval(x-s, y-s, x+s, y+s, fill=color, outline=color, tags=("sign",))
             created.append(id1)
-            hole_r = max(1.0, s * 0.22)
-            for angle in (90, 210, 330):
-                hx = x + math.cos(math.radians(angle)) * s * 0.45
-                hy = y - math.sin(math.radians(angle)) * s * 0.45
-                hole = self.canvas.create_oval(
-                    hx - hole_r, hy - hole_r, hx + hole_r, hy + hole_r,
-                    fill=self.C_SURFACE, outline=self.C_SURFACE, tags=("sign",))
-                created.append(hole)
-                decor_items.add(hole)
         elif sign_lower == "square":
             # Polygon for the same reason as the goal: rectangles cannot be rotated.
             id1 = self.canvas.create_polygon(x-s, y-s, x+s, y-s, x+s, y+s, x-s, y+s,
@@ -4381,13 +5487,14 @@ class FloorballTacticsApp:
         if clicked_drawn and self.active_tool is None:
             self.dragging_drawn_mode = True
             ctrl = (event.state & 0x4) != 0
+            family = self._drawn_siblings(clicked_drawn)
             if ctrl:
                 if clicked_drawn in self.selected_drawn:
-                    self.selected_drawn.remove(clicked_drawn)
+                    self.selected_drawn -= family
                 else:
-                    self.selected_drawn.add(clicked_drawn)
+                    self.selected_drawn |= family
             else:
-                self.selected_drawn = {clicked_drawn}
+                self.selected_drawn = set(family)
             self.selected_tokens.clear()
             self.highlight_selected()
             self.drag_data["x"] = event.x
@@ -4404,6 +5511,16 @@ class FloorballTacticsApp:
 
         if self.active_tool is None:
             self.clear_selection()
+            # Nothing of the user's own is under the pointer, so a fixture of the rink
+            # itself may be: a goal, a cross, the centre line, the boards. They select
+            # like anything else, which is what makes them deletable.
+            part = self._pitch_part_at(event.x, event.y)
+            if part:
+                self.selected_pitch_parts = {part}
+                self.highlight_selected()
+                # No return: the rubber band still starts here, so a drag that happens
+                # to begin on the boards or the centre line lassos as it always did.
+                # The release drops the fixture again if the pointer actually moved.
             self.selection_start = (event.x, event.y)
             self.selection_rect = self.canvas.create_rectangle(event.x, event.y, event.x, event.y, dash=(4,4), outline="#228be6")
         elif self.active_tool == "text":
@@ -4467,13 +5584,11 @@ class FloorballTacticsApp:
             if not self.resize_anchor or not self.resize_initial_bounds:
                 return
             keep_ratio = (event.state & 0x1) != 0
-            dx = event.x - self.resize_start[0] if self.resize_start else 0
-            dy = event.y - self.resize_start[1] if self.resize_start else 0
-            if abs(dx) < 8 and abs(dy) < 8:
-                drag_x, drag_y = self.resize_start
-            else:
-                drag_x = self.resize_start[0] + dx * 0.12 if self.resize_start else event.x
-                drag_y = self.resize_start[1] + dy * 0.12 if self.resize_start else event.y
+            # The corner goes where the pointer goes. It used to travel a twelfth of
+            # the distance and then have the result damped again on the way out, which
+            # between them meant a long drag moved a sign by half a pixel -- the marks
+            # looked as though they could not be resized at all.
+            drag_x, drag_y = event.x, event.y
             drag_x = max(0, min(drag_x, self.width))
             drag_y = max(0, min(drag_y, self.height))
             if self.grid_var.get():
@@ -4503,16 +5618,7 @@ class FloorballTacticsApp:
                 # dragging the player is normally a repositioning, not a redraw of the
                 # play, so the arrow stays where it was. Hold Shift to bring it along.
                 if getattr(self, "_drag_keep_attached", False):
-                    for line_id in token.get("attached_lines_start", []):
-                        coords = self.canvas.coords(line_id)
-                        if coords and len(coords) >= 4:
-                            coords[0] += dx; coords[1] += dy
-                            self.canvas.coords(line_id, *coords)
-                    for line_id in token.get("attached_lines_end", []):
-                        coords = self.canvas.coords(line_id)
-                        if coords and len(coords) >= 4:
-                            coords[-2] += dx; coords[-1] += dy
-                            self.canvas.coords(line_id, *coords)
+                    self.move_attached_line_ends(token, dx, dy)
 
             self.drag_data["x"] = event.x
             self.drag_data["y"] = event.y
@@ -4596,18 +5702,8 @@ class FloorballTacticsApp:
                                 if "text_ids" in token:
                                     for tid in token["text_ids"]:
                                         self.canvas.move(tid, dx, dy)
-                                for line_id in token.get("attached_lines_start", []):
-                                    coords = self.canvas.coords(line_id)
-                                    if coords and len(coords) >= 4:
-                                        coords[0] += dx
-                                        coords[1] += dy
-                                        self.canvas.coords(line_id, *coords)
-                                for line_id in token.get("attached_lines_end", []):
-                                    coords = self.canvas.coords(line_id)
-                                    if coords and len(coords) >= 4:
-                                        coords[-2] += dx
-                                        coords[-1] += dy
-                                        self.canvas.coords(line_id, *coords)
+                                if getattr(self, "_drag_keep_attached", False):
+                                    self.move_attached_line_ends(token, dx, dy)
 
             label_moves = {}
             for sid, old_coords in self.drag_start_positions.items():
@@ -4666,6 +5762,10 @@ class FloorballTacticsApp:
             self.selection_rect = None
             self.selected_tokens.clear()
             self.selected_drawn.clear()
+            if (xmax - xmin) > 3 or (ymax - ymin) > 3:
+                # A real lasso, not a click: whatever fixture the drag started on was
+                # only ever a click's worth of selection.
+                self.selected_pitch_parts.clear()
             for token in self.tokens.values():
                 sid = token["shape_id"]
                 coords = self.canvas.coords(sid)
@@ -4673,14 +5773,14 @@ class FloorballTacticsApp:
                     cx, cy = (coords[0] + coords[2]) / 2, (coords[1] + coords[3]) / 2
                     if xmin <= cx <= xmax and ymin <= cy <= ymax:
                         self.selected_tokens.append(sid)
-            for cid, meta in self.drawn_items.items():
+            for cid, meta in list(self.drawn_items.items()):
                 coords = self.canvas.coords(cid)
                 if not coords:
                     continue
                 cx = sum(coords[0::2]) / (len(coords[0::2]) or 1)
                 cy = sum(coords[1::2]) / (len(coords[1::2]) or 1)
                 if xmin <= cx <= xmax and ymin <= cy <= ymax:
-                    self.selected_drawn.add(cid)
+                    self.selected_drawn |= self._drawn_siblings(cid)
             self.highlight_selected()
             return
 
@@ -4711,6 +5811,7 @@ class FloorballTacticsApp:
     def clear_selection(self):
         self.selected_tokens.clear()
         self.selected_drawn.clear()
+        self.selected_pitch_parts.clear()
         for token in self.tokens.values():
             try:
                 # width matches _create_token so deselecting does not thin the
@@ -4916,12 +6017,18 @@ class FloorballTacticsApp:
             new_coords.append(max(12, min(self.width - 12, new_value)))
         return new_coords
 
+    RESIZE_MIN_SCALE = 0.05
+    RESIZE_MAX_SCALE = 20.0
+
     def _get_resize_scale(self, current_size, original_size):
+        """How much the box grew, bounded only by what stays sane on a canvas.
+
+        No damping: a handle that does a tenth of what the hand does is a handle that
+        appears not to work."""
         if original_size <= 0:
             return 1.0
         ratio = current_size / original_size
-        damped_ratio = 1.0 + (ratio - 1.0) * 0.1
-        return max(0.85, min(1.15, damped_ratio))
+        return max(self.RESIZE_MIN_SCALE, min(self.RESIZE_MAX_SCALE, ratio))
 
     def _apply_resized_selection(self, new_bounds):
         if not self.resize_initial_bounds:
@@ -4974,19 +6081,66 @@ class FloorballTacticsApp:
                 self.canvas.move(item, new_cx - old_cx, new_cy - old_cy)
             for tid in token.get("text_ids", []):
                 self.canvas.move(tid, new_cx - old_cx, new_cy - old_cy)
-            for line_id in token.get("attached_lines_start", []):
-                coords = self.canvas.coords(line_id)
-                if coords and len(coords) >= 4:
-                    coords[0] += dx
-                    coords[1] += dy
-                    self.canvas.coords(line_id, *coords)
-            for line_id in token.get("attached_lines_end", []):
-                coords = self.canvas.coords(line_id)
-                if coords and len(coords) >= 4:
-                    coords[-2] += dx
-                    coords[-1] += dy
-                    self.canvas.coords(line_id, *coords)
+            self.move_attached_line_ends(token, dx, dy)
             token["starting_pos"] = (new_cx, new_cy)
+
+    def _wait_modal(self, window):
+        """Block until the dialog closes, without minding if it already has.
+
+        Anything can close a dialog while the grab is being taken -- a window manager,
+        a timer, the user -- and waiting on a window that is already gone is not an
+        error worth taking the caller down for."""
+        try:
+            self.root.wait_window(window)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _make_modal(window):
+        """Take the input grab, once the window is actually on screen.
+
+        grab_set() on a window the window manager has not mapped yet fails with
+        "grab failed: window not viewable" and takes the dialog down with it, which is
+        a race rather than a mistake: whether the map has happened by the time the next
+        line runs depends on the machine. Waiting for the map first makes it a
+        certainty, and a dialog that cannot be grabbed at all is still a usable dialog,
+        so a failure here is not worth raising."""
+        # update_idletasks, never wait_visibility: waiting blocks until the window
+        # manager maps the window, and if it never does -- no window manager, a
+        # window closed from elsewhere first -- the whole application hangs there.
+        try:
+            window.update_idletasks()
+        except Exception:
+            pass
+        for _ in range(3):
+            try:
+                self._make_modal(window)
+                return True
+            except Exception:
+                try:
+                    window.update()
+                except Exception:
+                    break
+        return False
+
+    def _drawn_siblings(self, cid):
+        """Every canvas item that makes up the same drawing as this one.
+
+        A ball is a body and three holes, an X is two strokes, a shot is two shafts
+        and a head. Clicking one piece has to take the whole mark, or dragging it
+        leaves the rest of the drawing behind."""
+        meta = self.drawn_items.get(cid)
+        if not meta:
+            return {cid}
+        group = meta.get("group")
+        data = meta.get("data")
+        found = {cid}
+        for other, other_meta in self.drawn_items.items():
+            if group and other_meta.get("group") == group:
+                found.add(other)
+            elif data is not None and other_meta.get("data") is data:
+                found.add(other)
+        return found
 
     def _get_selected_line_item(self):
         if len(self.selected_drawn) == 1:
@@ -5134,6 +6288,26 @@ class FloorballTacticsApp:
                 except Exception:
                     pass
         self._draw_selection_overlay()
+        self._highlight_pitch_parts()
+
+    # How a curve is drawn for each line type: its dashes, how much heavier than a
+    # plain line it is, and whether it carries an arrowhead. Solid lines and the run
+    # keep the plain weight; a shot is the one that is meant to look heavy.
+    BEND_STYLES = {
+        "solid":   (None,   0, True),
+        "dashed":  ((6, 4), 0, True),
+        "dotted":  ((2, 4), 0, True),
+        "pass":    ((4, 4), 0, True),
+        "shot":    (None,   1, True),
+        "dribble": ((2, 3), 0, True),
+        "run":     ((8, 3), 0, True),
+    }
+
+    def _bend_style(self, ltype, base_width):
+        """The dash pattern, width and head a bend of this line type is drawn with."""
+        dash, extra, arrow = self.BEND_STYLES.get(str(ltype).lower(),
+                                                  self.BEND_STYLES["solid"])
+        return dash, max(1, base_width + extra), arrow
 
     def draw_tactical_line_canvas(self, tool, x1, y1, x2, y2, preview=False, extra_data=None):
         created_ids = []
@@ -5185,14 +6359,18 @@ class FloorballTacticsApp:
         elif effective_tool == "bend":
             cx = extra_data.get("cx", (x1+x2)/2) if extra_data else (x1+x2)/2
             cy = extra_data.get("cy", (y1+y2)/2) if extra_data else (y1+y2)/2
-            if self.curved_arches_var.get():
-                dx_off, dy_off = -(y2 - y1) * 0.15, (x2 - x1) * 0.15
-                lid1 = self.canvas.create_line(x1, y1, cx + dx_off, cy + dy_off, x2, y2, smooth=True, fill=color, width=width, dash=dash_tuple, tags=("tactic_line",))
-                lid2 = self.canvas.create_line(x1, y1, cx - dx_off, cy - dy_off, x2, y2, smooth=True, fill=color, width=width, dash=dash_tuple, arrow=tk.LAST, arrowshape=big_arrow, tags=("tactic_line",))
-                created_ids.extend([lid1, lid2])
-            else:
-                lid = self.canvas.create_line(x1, y1, cx, cy, x2, y2, smooth=True, fill=color, width=width, dash=dash_tuple, arrow=tk.LAST, arrowshape=big_arrow, tags=("tactic_line",))
-                created_ids.append(lid)
+            # A bend is a shape, not a kind of line: whatever type is armed -- a pass,
+            # a shot, a dribble, a run, or a plain dashed or dotted line -- can be
+            # drawn as a curve, and comes out with that type's dashes, weight and head.
+            bend_dash, bend_width, bend_arrow = self._bend_style(ltype, base_width)
+            # base_width as the floor, not the heavier arrow width: a curve carries
+            # more ink than a straight line of the same thickness and came out looking
+            # fatter than every other arrow on the board.
+            lid = self.canvas.create_line(x1, y1, cx, cy, x2, y2, smooth=True,
+                                          fill=color, width=bend_width, dash=bend_dash,
+                                          arrow=tk.LAST if bend_arrow else None,
+                                          arrowshape=big_arrow, tags=("tactic_line",))
+            created_ids.append(lid)
         elif effective_tool == "shot":
             dx, dy = x2 - x1, y2 - y1
             dist = math.hypot(dx, dy)
@@ -5229,8 +6407,15 @@ class FloorballTacticsApp:
             created_ids.append(lid)
 
         if created_ids and not preview:
+            # One tag for every piece of this arrow. A shot is two shafts and a head,
+            # and they have to be recognised as one drawing -- for selecting, for
+            # resizing, and for working out which line the arrow actually runs along.
+            self._line_group_seq = getattr(self, "_line_group_seq", 0) + 1
+            group_tag = f"linegrp{self._line_group_seq}"
             for cid in created_ids:
-                self.drawn_items[cid] = {"type": "tactic_line", "tool": tool, "color": color}
+                self.canvas.addtag_withtag(group_tag, cid)
+                self._register_drawn_item(cid, {"type": "tactic_line", "tool": tool,
+                                                "group": group_tag, "color": color})
         return created_ids
 
     def on_window_resize(self, event):
@@ -5400,6 +6585,82 @@ class FloorballTacticsApp:
         self.selected_tokens = [s for s in self.selected_tokens if s in self.tokens]
         self.groups = [g for g in self.groups if not g.intersection({token.get("shape_id")})]
 
+    def _token_centre_px(self, token):
+        """A player's centre in pixels, as floats, taken from the shape's own
+        coordinates rather than from its bounding box.
+
+        canvas.bbox() reports whole pixels. Positioning by it therefore leaves up to
+        half a pixel of error, and which half depends on where the token happened to
+        be standing beforehand -- so loading the same file twice produced boards that
+        were not quite identical, and two exports of the same play differed in every
+        single frame."""
+        sid = token.get("shape_id") if isinstance(token, dict) else None
+        if sid is None:
+            return None
+        try:
+            kind = self.canvas.type(sid)
+            coords = self.canvas.coords(sid)
+        except Exception:
+            return None
+        if not coords:
+            box = self.canvas.bbox(sid)
+            return ((box[0] + box[2]) / 2.0, (box[1] + box[3]) / 2.0) if box else None
+        xs, ys = coords[0::2], coords[1::2]
+        if kind in ("oval", "rectangle", "arc") and len(xs) >= 2:
+            return ((xs[0] + xs[1]) / 2.0, (ys[0] + ys[1]) / 2.0)
+        return (sum(xs) / len(xs), sum(ys) / len(ys))
+
+    def _token_spec(self, token):
+        """Everything about a player that is needed to build them again, with the
+        position in rink metres so it survives a resize or a change of field."""
+        centre = self._token_centre_px(token)
+        if not centre:
+            return None
+        state = self._pitch_state()
+        mx, my = self._state_px_to_m(centre[0], centre[1], state)
+        return {"label": token.get("label"), "team": self._token_team(token),
+                "shape": token.get("shape", "circle"),
+                "color": token.get("color", "black"),
+                "size": token.get("size", 14),
+                "position": token.get("position"),
+                "locked": bool(token.get("locked", False)),
+                "is_ghost": bool(token.get("is_ghost")),
+                "mx": mx, "my": my}
+
+    def _restore_token(self, spec):
+        """Put a deleted player back where they stood."""
+        if not spec or self._get_sid_by_label(spec.get("label")):
+            return None
+        px, py = self._rink_to_px(spec.get("mx", 0.0), spec.get("my", 0.0))
+        sid = self._create_token(px, py, spec["label"],
+                                 shape=spec.get("shape", "circle"),
+                                 color=spec.get("color", "black"),
+                                 size=spec.get("size"),
+                                 team=spec.get("team"))
+        token = self.tokens.get(sid)
+        if token:
+            token["locked"] = spec.get("locked", False)
+            if spec.get("is_ghost"):
+                token["is_ghost"] = True
+            self._set_token_position(token, spec.get("position"))
+        return sid
+
+    def _refresh_roster_counts(self):
+        """Make the roster boxes say how many players are actually on the board.
+
+        Without this a deleted player left the box reading five with four on the rink,
+        and typing five back in changed nothing -- the box already said five, so
+        nobody was added and the player looked unrecoverable."""
+        for team, spinbox in (("att", getattr(self, "att_spinbox", None)),
+                              ("def", getattr(self, "def_spinbox", None))):
+            if spinbox is None:
+                continue
+            try:
+                spinbox.delete(0, tk.END)
+                spinbox.insert(0, str(len(self._team_tokens(team))))
+            except Exception:
+                pass
+
     def _set_team_count(self, team, count):
         """Resize one team in place. _update_roster() would do it by deleting every
         token on the board and respawning the default formation, taking the other
@@ -5420,9 +6681,9 @@ class FloorballTacticsApp:
             while len(tokens) < count:
                 label = f"{prefix}{index}"
                 if label not in taken:
+                    rink_len, rink_wid = self._rink_size()
                     spot_x, spot_y = self._rink_to_px(
-                        (20.0 if self.half_rink_var.get() else 40.0) * (0.3 if team == "att" else 0.7),
-                        10.0)
+                        rink_len * (0.3 if team == "att" else 0.7), rink_wid / 2)
                     sid = self._create_token(spot_x, spot_y, label, shape=shape,
                                              color=color, size=size, team=team)
                     tokens.append(self.tokens[sid])
@@ -5470,8 +6731,7 @@ class FloorballTacticsApp:
         if not getattr(self, "pitch_scale", None):
             return
 
-        rink_len = 20.0 if self.half_rink_var.get() else 40.0
-        rink_wid = 20.0
+        rink_len, rink_wid = self._rink_size()
         zone = 0.35 * rink_len          # how much rink the formation spans front-to-back
         margin = 2.0                    # keep bodies off the boards
 
@@ -5505,6 +6765,105 @@ class FloorballTacticsApp:
                 "Tactics",
                 f"{name} uses {len(slots)} players but only {len(tokens)} are on the "
                 f"board, so the last {len(slots) - len(tokens)} position(s) were skipped.")
+
+    # How far in and out the board can be taken, and by how much a keypress moves.
+    ZOOM_MIN = 0.4
+    ZOOM_MAX = 4.0
+    ZOOM_STEP = 1.25
+
+    def set_zoom(self, value):
+        """Draw the rink at this magnification.
+
+        Everything on the board is held in rink metres, so a zoom is nothing more than
+        a different scale in the projection: the players, the drawings and the images
+        all land where they belong at the new size, exactly as they do after a resize
+        or a change of field."""
+        value = max(self.ZOOM_MIN, min(self.ZOOM_MAX, float(value)))
+        if abs(value - self.zoom) < 1e-6:
+            return False
+        self.zoom = value
+        self.redraw_canvas()
+        self._update_indicators()
+        return True
+
+    def _pan_limits(self, w=None, h=None, rink_len=None, rink_wid=None, scale=None):
+        """How far the board may be scrolled in each direction, in pixels.
+
+        Only whatever the zoom has pushed past the edge of the canvas: half of the
+        overhang either side, since the rink is centred."""
+        if scale is None:
+            scale = getattr(self, "pitch_scale", None)
+        if not scale:
+            return 0.0, 0.0
+        if rink_len is None or rink_wid is None:
+            rink_len, rink_wid = self._rink_size()
+        if w is None or h is None:
+            w, h = self.width, self.height
+        span_x, span_y = ((rink_wid, rink_len) if self.rink_rotated
+                          else (rink_len, rink_wid))
+        return (max(0.0, (span_x * scale - w) / 2.0),
+                max(0.0, (span_y * scale - h) / 2.0))
+
+    def _clamp_pan(self, w=None, h=None, rink_len=None, rink_wid=None, scale=None):
+        limit_x, limit_y = self._pan_limits(w, h, rink_len, rink_wid, scale)
+        self.pan_x = max(-limit_x, min(limit_x, self.pan_x))
+        self.pan_y = max(-limit_y, min(limit_y, self.pan_y))
+        return limit_x, limit_y
+
+    # How far one notch of the wheel moves the board.
+    SCROLL_STEP = 60
+
+    def scroll_board(self, dx=0, dy=0):
+        """Move the view over a zoomed-in board. False when there is nothing hidden."""
+        limit_x, limit_y = self._pan_limits()
+        if limit_x <= 0 and limit_y <= 0:
+            return False
+        before = (self.pan_x, self.pan_y)
+        self.pan_x += dx
+        self.pan_y += dy
+        self._clamp_pan()
+        if (self.pan_x, self.pan_y) == before:
+            return False
+        self.redraw_canvas()
+        return True
+
+    def _on_mouse_wheel(self, event):
+        """The wheel scrolls the board up and down; with Shift, left and right.
+
+        X11 reports the wheel as buttons 4-7 and everything else as <MouseWheel> with
+        a delta, so both arrive here."""
+        step = self.SCROLL_STEP
+        if getattr(event, "num", None) in (4, 6):
+            amount = step
+        elif getattr(event, "num", None) in (5, 7):
+            amount = -step
+        else:
+            delta = getattr(event, "delta", 0)
+            if not delta:
+                return None
+            amount = step if delta > 0 else -step
+        sideways = bool(getattr(event, "state", 0) & 0x1) or \
+            getattr(event, "num", None) in (6, 7)
+        if sideways:
+            self.scroll_board(dx=amount)
+        else:
+            self.scroll_board(dy=amount)
+        return "break"
+
+    def zoom_in(self, event=None):
+        self.set_zoom(self.zoom * self.ZOOM_STEP)
+        return "break"
+
+    def zoom_out(self, event=None):
+        self.set_zoom(self.zoom / self.ZOOM_STEP)
+        return "break"
+
+    def zoom_reset(self, event=None):
+        """Back to the whole rink filling the canvas, and centred again."""
+        self.pan_x = self.pan_y = 0.0
+        if not self.set_zoom(1.0):
+            self.redraw_canvas()
+        return "break"
 
     def toggle_rink_orientation(self):
         self.rotate_rink("vertical" if not self.rink_rotated else "horizontal")
@@ -5576,6 +6935,7 @@ class FloorballTacticsApp:
                 "att_pct": self.att_pct_var.get(),
                 "def_pct": self.def_pct_var.get(),
                 "half_rink": self.half_rink_var.get(),
+                "rink_mode": self.rink_mode,
                 "grid": self.grid_var.get(),
                 "snap_player": self.snap_player_var.get(),
                 "snap_angle": self.snap_angle_var.get(),
@@ -5632,16 +6992,17 @@ class FloorballTacticsApp:
         # What undo has to come back to: whatever was on the board before this file was
         # picked, not the freshly loaded logo the editor is about to open with.
         self._watermark_baseline = (self._watermark_snapshot(), True)
-        rink_len = 20.0 if self.half_rink_var.get() else 40.0
+        rink_len, rink_wid = self._rink_size()
         w_m = min(self.WATERMARK_DEFAULT_W_M, rink_len * 0.6)
         h_m = w_m * image.height / image.width
-        if h_m > 16.0:                      # keep the first placement inside the boards
-            h_m = 16.0
+        if h_m > rink_wid * 0.8:            # keep the first placement inside the boards
+            h_m = rink_wid * 0.8
             w_m = h_m * image.width / image.height
         self.watermark = {"path": path, "original": image, "crop": None,
                           "bg_tolerance": None, "bg_mode": None, "behind": True,
                           "opacity": 100,
-                          "mx": rink_len / 2.0, "my": 10.0, "w_m": w_m, "h_m": h_m}
+                          "mx": rink_len / 2.0, "my": rink_wid / 2.0,
+                          "w_m": w_m, "h_m": h_m}
         self._refresh_watermark_image()
         self._render_watermark()
         self._open_watermark_editor()
@@ -5737,37 +7098,53 @@ class FloorballTacticsApp:
             except Exception:
                 pass
 
-    def _preview_pitch_state(self, rink_len, long_px=720, short_px=430, pad=18):
+    def _preview_pitch_state(self, rink_len, rink_wid=20.0, long_px=720, short_px=430,
+                             pad=18):
         """Mapping for the placement preview: the same rink-metre projection the board
         itself uses, so a position picked in the preview lands identically on the rink."""
-        scale = min(long_px / rink_len, short_px / 20.0)
+        scale = min(long_px / rink_len, short_px / rink_wid)
         st = {"scale": scale, "ox": pad, "oy": pad,
-              "rotated": self.rink_rotated, "rink_len": rink_len}
-        span_x, span_y = (20.0, rink_len) if self.rink_rotated else (rink_len, 20.0)
+              "rotated": self.rink_rotated, "rink_len": rink_len, "rink_wid": rink_wid}
+        span_x, span_y = ((rink_wid, rink_len) if self.rink_rotated
+                          else (rink_len, rink_wid))
         return st, int(span_x * scale) + 2 * pad, int(span_y * scale) + 2 * pad
 
-    def _draw_preview_rink(self, canvas, st, rink_len):
+    def _draw_preview_rink(self, canvas, st, rink_len, rink_wid=20.0):
         """A stripped-down rink for the placement preview: boards, centre spot and
         circle, goal areas and goals. Enough to judge where a logo sits."""
         def p(mx, my):
             return self._state_m_to_px(mx, my, st)
 
-        canvas.create_rectangle(*p(0, 0), *p(rink_len, 20), fill="#ffffff",
+        # Measured out of the same markings the real board is drawn from, so the
+        # preview is the field the logo will actually land on.
+        half = self.half_rink
+        marks = self._rink_markings()
+        mid = rink_wid / 2.0
+        canvas.create_rectangle(*p(0, 0), *p(rink_len, rink_wid), fill="#ffffff",
                                 outline="#343a40", width=2)
-        centre_mx = 0.0 if rink_len <= 20.0 else rink_len / 2.0
-        if rink_len > 20.0:
-            canvas.create_line(*p(centre_mx, 0), *p(centre_mx, 20), fill="#ced4da", width=2)
-        canvas.create_oval(*p(centre_mx - 1.5, 8.5), *p(centre_mx + 1.5, 11.5),
-                           outline="#ced4da", width=2)
-        canvas.create_oval(*p(centre_mx - 0.2, 9.8), *p(centre_mx + 0.2, 10.2),
+        centre_mx = 0.0 if half else rink_len / 2.0
+        if not half:
+            canvas.create_line(*p(centre_mx, 0), *p(centre_mx, rink_wid),
+                               fill="#ced4da", width=2)
+        circle_r = marks["circle"]            # the small fields have a spot but no circle
+        if circle_r:
+            canvas.create_oval(*p(centre_mx - circle_r, mid - circle_r),
+                               *p(centre_mx + circle_r, mid + circle_r),
+                               outline="#ced4da", width=2)
+        canvas.create_oval(*p(centre_mx - 0.2, mid - 0.2), *p(centre_mx + 0.2, mid + 0.2),
                            fill="#343a40", outline="#343a40")
-        for goal_mx, inward in ((2.85, 1.0), (rink_len - 2.85, -1.0)):
-            if rink_len <= 20.0 and inward > 0:
+        goal_line = marks["goal_line"]
+        # The outermost goal area: on the large field that is the goal area around
+        # the crease, on the small ones the single goalkeeper area.
+        area_depth, area_width = marks["areas"][-1]
+        for goal_mx, inward in ((goal_line, 1.0), (rink_len - goal_line, -1.0)):
+            if half and inward > 0:
                 continue                      # the half rink only has the far goal
-            canvas.create_rectangle(*p(goal_mx, 6.0), *p(goal_mx + inward * 5.0, 14.0),
+            canvas.create_rectangle(*p(goal_mx, mid - area_width / 2),
+                                    *p(goal_mx + inward * area_depth, mid + area_width / 2),
                                     outline="#ced4da", width=2)
-            canvas.create_rectangle(*p(goal_mx - inward * 0.4, 9.0),
-                                    *p(goal_mx, 11.0),
+            canvas.create_rectangle(*p(goal_mx - inward * 0.4, mid - 0.8),
+                                    *p(goal_mx, mid + 0.8),
                                     fill="#000000", outline="#000000")
 
     def _open_watermark_editor(self):
@@ -5785,8 +7162,8 @@ class FloorballTacticsApp:
         if not wm.get("image"):
             self._refresh_watermark_image(wm)
         original = dict(wm)
-        rink_len = 20.0 if self.half_rink_var.get() else 40.0
-        st, cv_w, cv_h = self._preview_pitch_state(rink_len)
+        rink_len, rink_wid = self._rink_size()
+        st, cv_w, cv_h = self._preview_pitch_state(rink_len, rink_wid)
 
         win = tk.Toplevel(self.root)
         win.title("Place Watermark")
@@ -5817,7 +7194,7 @@ class FloorballTacticsApp:
 
         def redraw():
             cv.delete("all")
-            self._draw_preview_rink(cv, st, rink_len)
+            self._draw_preview_rink(cv, st, rink_len, rink_wid)
             x1, y1, x2, y2 = box_px()
             px_w = max(1, int(round(x2 - x1)))
             px_h = max(1, int(round(y2 - y1)))
@@ -5874,7 +7251,7 @@ class FloorballTacticsApp:
             if drag["mode"] == "move":
                 gx, gy = self._state_px_to_m(event.x, event.y, st)
                 state["mx"] = min(max(gx + drag["grab"][0], 0.0), rink_len)
-                state["my"] = min(max(gy + drag["grab"][1], 0.0), 20.0)
+                state["my"] = min(max(gy + drag["grab"][1], 0.0), rink_wid)
             else:
                 ax, ay = drag["anchor"]
                 w_m = abs(event.x - ax) / st["scale"]
@@ -6067,7 +7444,7 @@ class FloorballTacticsApp:
         win.protocol("WM_DELETE_WINDOW", cancel)
 
         redraw()
-        win.grab_set()
+        self._make_modal(win)
 
     def copy_selection(self):
         data = []
@@ -6105,6 +7482,53 @@ class FloorballTacticsApp:
         self.delete_selection()
         return "break"
 
+    def _remove_key(self, event=None):
+        """Backspace: the second way to remove something.
+
+        Delete takes a mark off the board there and then. Backspace instead writes the
+        removal into the play: the mark stays on the rink while you work, the timeline
+        gains a line saying it goes, and during the animation it disappears when that
+        group comes up. Players have no such half-state, so for them Backspace is a
+        plain delete."""
+        try:
+            focused = self.root.focus_get()
+        except Exception:
+            focused = None
+        if isinstance(focused, self.TEXT_ENTRY_WIDGETS):
+            return None
+        if self.selected_drawn:
+            self.remove_selection_at_group()
+        elif self.selected_tokens:
+            self.delete_selection()
+        return "break"
+
+    def _drawn_label(self, cid):
+        """What to call a drawing in the timeline."""
+        meta = self.drawn_items.get(cid) or {}
+        name = (meta.get("sign_type") or meta.get("tool")
+                or meta.get("type") or "drawing")
+        return str(name).capitalize()
+
+    def remove_selection_at_group(self):
+        """Mark the selection as going away when the open group is reached."""
+        index = max(0, len(self.animation_steps) - 1)
+        marked = []
+        for cid in self._selected_drawn_ids():
+            meta = self.drawn_items.get(cid)
+            if meta is None or meta.get("decor"):
+                continue
+            meta["anim_remove_group"] = index
+            marked.append(cid)
+        if not marked:
+            return 0
+        # One line per mark, not per canvas item: a ball is four items and a shot is
+        # three, and the timeline should not say so four times.
+        for name in dict.fromkeys(self._drawn_label(cid) for cid in marked):
+            self.record_action_in_group(f"Remove {name}")
+        self._refresh_animation_list()
+        self.highlight_selected()
+        return len(marked)
+
     def delete_selection(self, event=None):
         """Remove everything selected: players, signs and drawn lines alike.
 
@@ -6113,6 +7537,7 @@ class FloorballTacticsApp:
         an X orphaned on the canvas."""
         removed = 0
         seen = set()
+        doomed = []
         for sid in list(self.selected_tokens):
             token = self.tokens.get(sid)
             if not token or token.get("locked", False):
@@ -6121,8 +7546,12 @@ class FloorballTacticsApp:
             if key in seen:
                 continue
             seen.add(key)
-            self._delete_token(token)
-            removed += 1
+            doomed.append(token)
+        if doomed:
+            # Through a command: a player deleted by mistake used to be gone for good,
+            # with undo stepping straight past it to whatever happened before.
+            self.push_command(DeleteTokensCommand(self, doomed))
+            removed += len(doomed)
         for cid in self._selected_drawn_ids():
             try:
                 self.canvas.delete(cid)
@@ -6134,6 +7563,12 @@ class FloorballTacticsApp:
             removed += 1
         self.selected_drawn.clear()
         self.selected_tokens = [s for s in self.selected_tokens if s in self.tokens]
+        if self.selected_pitch_parts:
+            # Through a command: a goal or a face-off cross cannot be drawn back by
+            # hand, so removing one has to be something undo can take back.
+            parts = set(self.selected_pitch_parts)
+            self.push_command(HidePitchPartsCommand(self, parts))
+            removed += len(parts)
         if removed:
             self.highlight_selected()
         return removed
@@ -6158,9 +7593,16 @@ class FloorballTacticsApp:
             if cid in self.drawn_items:
                 if cid not in self.selected_drawn:
                     self.clear_selection()
-                    self.selected_drawn = {cid}
+                    self.selected_drawn = self._drawn_siblings(cid)
                     self.highlight_selected()
                 return "drawn"
+        part = self._pitch_part_at(event.x, event.y)
+        if part:
+            if part not in self.selected_pitch_parts:
+                self.clear_selection()
+                self.selected_pitch_parts = {part}
+                self.highlight_selected()
+            return "pitch"
         return "empty"
 
     def show_context_menu(self, event):
@@ -6187,6 +7629,16 @@ class FloorballTacticsApp:
             menu.add_command(label="Copy", command=self.copy_selection)
             menu.add_command(label="Cut", command=self.cut_selection)
             menu.add_command(label="Delete", command=self.delete_selection)
+        elif target == "pitch":
+            name = ", ".join(sorted({self.pitch_part_label(key)
+                                     for key in self.selected_pitch_parts}))
+            menu.add_command(label=f"Delete {name}", command=self.delete_selection)
+            menu.add_command(label="Restore Rink Features",
+                             command=self.restore_pitch_parts,
+                             state=tk.NORMAL if self.hidden_pitch_parts else tk.DISABLED)
+            menu.add_separator()
+            menu.add_command(label="Undo", command=self.undo,
+                             state=tk.NORMAL if self.undo_stack else tk.DISABLED)
         else:
             menu.add_command(label="Paste", command=self.paste_clipboard,
                              state=tk.NORMAL if self.clipboard else tk.DISABLED)
@@ -6194,6 +7646,9 @@ class FloorballTacticsApp:
             has_ghosts = any(t.get("is_ghost") for t in self.tokens.values())
             menu.add_command(label="Clear Ghosts", command=self.clear_ghosts,
                              state=tk.NORMAL if has_ghosts else tk.DISABLED)
+            menu.add_command(label="Restore Rink Features",
+                             command=self.restore_pitch_parts,
+                             state=tk.NORMAL if self.hidden_pitch_parts else tk.DISABLED)
             menu.add_separator()
             menu.add_command(label="Undo", command=self.undo,
                              state=tk.NORMAL if self.undo_stack else tk.DISABLED)
@@ -6317,8 +7772,12 @@ class FloorballTacticsApp:
         messagebox.showinfo("Pasted", "Pasted clipboard items.")
 
     def select_all(self):
+        # Everything the user put on the board -- not the rink it is played on. Select
+        # All followed by Delete is a common enough reflex that including the goals
+        # and the face-off crosses in it would be a trap.
         self.selected_tokens.clear()
         self.selected_drawn.clear()
+        self.selected_pitch_parts.clear()
         seen = set()
         for sid, token in self.tokens.items():
             if token and token.get("shape_id") not in seen:
@@ -6357,15 +7816,181 @@ class FloorballTacticsApp:
         if snap:
             self._restore_rink_positions(snap, old_st)
 
+    # ----------------------
+    # Rink size
+    # ----------------------
+    # The fields are named after the game they are played with, because that is what
+    # a coach picks. Length x width in metres, always the whole field: the half rink
+    # is a view of one end of whichever of these is chosen, not a field of its own.
+    #   5v5  IFF large-field floorball, 40 x 20 m.
+    #   4v4  NeFUB small field, 27 x 15 m.
+    #   3v3  NeFUB / IFF 3v3, 22 x 11 m (Rules of the Game 2025, rule 101).
+    RINK_SIZES = {"5v5": (40.0, 20.0), "4v4": (27.0, 15.0), "3v3": (22.0, 11.0)}
+    RINK_LABELS = {mode: mode for mode in RINK_SIZES}
+    # On the button itself the field needs saying out loud, or it reads as the
+    # old full/half toggle it replaced.
+    RINK_BUTTON_LABELS = {mode: f"Rink: {name}"
+                          for mode, name in RINK_LABELS.items()}
+    RINK_ORDER = ("5v5", "4v4", "3v3")
+
+    # What the fields used to be called, and whether that name meant the half rink.
+    # Config files, saved boards and recorded macros written before the fields were
+    # named after the game still speak this language, so it is understood on the way
+    # in -- and only on the way in; nothing is written back out in it.
+    LEGACY_RINK_MODES = {"full": ("5v5", False), "half": ("5v5", True),
+                         "small": ("4v4", False)}
+
+    # The goal cage is the same on every field: 1.6 m between the posts, 1.15 m to
+    # the crossbar (which a plan view cannot show), 0.65 m deep.
+    # Shown in the bottom-left corner of the board.
+    CREDIT_TEXT = "\u00a9 Simon Wagener"
+
+    GOAL_MOUTH_M = 1.6
+    GOAL_HEIGHT_M = 1.15
+    GOAL_DEPTH_M = 0.65
+
+    # What each field is marked with, in metres.
+    #   corner_r    radius of the rounded corners of the boards
+    #   goal_line   distance from the end boards to the goal line
+    #   areas       the goal areas in front of each goal, as (depth, width)
+    #   circle      radius of the centre circle, or None where there is none
+    #   faceoff     how far the face-off marks sit in from the boards
+    #   penalty     distance from the goal line to the penalty spot, or None
+    #   sub_zone    substitution zones as (start from the centre line, length)
+    # The large field is the IFF one the app has always drawn. The 3v3 figures come
+    # from the NeFUB / IFF 3v3 Rules of the Game 2025, rules 101-104; the small-field
+    # figures from the NeFUB small-field diagram. The half rink borrows the markings
+    # of the field it is a half of, which is the whole point of it being a view
+    # rather than a field of its own.
+    RINK_MARKINGS = {
+        "5v5": {"corner_r": 2.0, "goal_line": 2.85, "areas": ((1.0, 2.5), (4.0, 5.0)),
+                "circle": 3.0, "faceoff": 2.85, "penalty": None, "sub_zone": None},
+        "4v4": {"corner_r": 1.5, "goal_line": 1.8, "areas": ((0.9, 1.9),),
+                "circle": None, "faceoff": 1.0, "penalty": 7.0, "sub_zone": (0.0, 5.0)},
+        "3v3": {"corner_r": 1.0, "goal_line": 2.5, "areas": ((1.0, 2.5),),
+                "circle": None, "faceoff": 2.0, "penalty": 5.0, "sub_zone": (4.0, 4.0)},
+    }
+
+    def _rink_markings(self):
+        return self.RINK_MARKINGS[self.rink_mode]
+
+    @property
+    def rink_mode(self):
+        mode = self.rink_mode_var.get()
+        return mode if mode in self.RINK_SIZES else self.RINK_ORDER[0]
+
+    @property
+    def half_rink(self):
+        """Whether only one end of the field is being drawn. Every field has a half."""
+        return bool(self.half_rink_var.get())
+
+    def _resolve_rink_mode(self, mode):
+        """A field name, old or current, as (mode, half) -- where half is None unless
+        the name itself said which half it meant. An unknown name is no field at all,
+        so it comes back as (None, None) for the caller to fall back from."""
+        if mode in self.RINK_SIZES:
+            # A current name says nothing about the half: that is its own switch now.
+            return mode, None
+        return self.LEGACY_RINK_MODES.get(mode, (None, None))
+
+    def _read_rink_mode(self, data):
+        """The field a config file or a saved board asks for, as (mode, half).
+
+        The half is taken from the file's own flag where it has one, and otherwise
+        from the field name, which is all the oldest files have to say about it."""
+        mode, implied_half = self._resolve_rink_mode(data.get("rink_mode"))
+        if mode is None:
+            mode = self.RINK_ORDER[0]
+        half = data.get("half_rink")
+        if half is None:
+            half = implied_half if implied_half is not None else self.half_rink
+        return mode, bool(half)
+
+    def _rink_size(self):
+        """The rink being drawn, as (length, width) in metres.
+
+        A half rink is the goal end of its field: half the length, full width."""
+        length, width = self.RINK_SIZES[self.rink_mode]
+        return (length / 2.0 if self.half_rink else length), width
+
+    def set_rink_mode(self, mode, redraw=True, half=None):
+        """Switch between the three fields, optionally setting the half rink with it.
+
+        Everything on the board is held in rink metres, so the players and the
+        drawings keep their place on the rink across the change rather than being
+        left where their pixels happened to be."""
+        mode, implied_half = self._resolve_rink_mode(mode)
+        if mode is None:
+            return
+        # An old name that meant the half rink still means it, so macros and files
+        # recorded against the old full/half toggle replay as they were recorded.
+        if half is None:
+            half = self.half_rink if implied_half is None else implied_half
+        half = bool(half)
+        # Not skipped when nothing appears to change: the Preferences radio buttons
+        # have already moved the variable by the time this runs, so a guard against
+        # the current mode would see its own new value and leave the board undrawn.
+        self.rink_mode_var.set(mode)
+        self.half_rink_var.set(half)
+        self._set_rink_team_sizes(mode)
+        self._update_indicators()
+        if redraw:
+            self.redraw_canvas()
+        self._save_config()
+
+    def set_half_rink(self, half, redraw=True):
+        """Show one end of the current field, or all of it.
+
+        Deliberately not guarded against being told what is already true: the
+        Preferences checkbox has flipped the variable before it calls this, and a
+        guard would then see no change and leave the board undrawn."""
+        self.half_rink_var.set(bool(half))
+        self._update_indicators()
+        if redraw:
+            self.redraw_canvas()
+        self._save_config()
+
+    def toggle_half_rink(self):
+        self.set_half_rink(not self.half_rink)
+
+    # How many players a side each field is played with. The half rink does not
+    # change this: half a 5v5 field is still 5v5, being drilled at one end.
+    RINK_TEAM_SIZES = {"5v5": 5, "4v4": 4, "3v3": 3}
+
+    def _set_rink_team_sizes(self, mode):
+        """Put both teams at the size the field is played with.
+
+        Through _set_team_count, which adds or removes players where they stand
+        rather than rebuilding the roster, so choosing a field does not throw away
+        an arrangement."""
+        wanted = self.RINK_TEAM_SIZES.get(mode)
+        if not wanted:
+            return
+        for team in ("att", "def"):
+            try:
+                if len(self._team_tokens(team)) != wanted:
+                    self._set_team_count(team, wanted)
+            except Exception:
+                pass
+
+    def cycle_rink_mode(self):
+        """5v5 -> 4v4 -> 3v3 -> 5v5. One button, because the toolbar is two rows and
+        a field apiece was not worth three quarters of one. The half rink is left
+        alone: it is a view of whichever field this lands on."""
+        order = self.RINK_ORDER
+        self.set_rink_mode(order[(order.index(self.rink_mode) + 1) % len(order)])
+
     def _pitch_state(self):
         """The mapping currently on screen, captured so positions can be converted
         back out of pixels after the pitch is redrawn at a new scale/origin."""
+        rink_len, rink_wid = self._rink_size()
         return {
             "scale": getattr(self, "pitch_scale", None),
             "ox": getattr(self, "pitch_ox", None),
             "oy": getattr(self, "pitch_oy", None),
             "rotated": self.rink_rotated,
-            "rink_len": 20.0 if self.half_rink_var.get() else 40.0,
+            "rink_len": rink_len,
+            "rink_wid": rink_wid,
         }
 
     @staticmethod
@@ -6416,7 +8041,7 @@ class FloorballTacticsApp:
         if not st["scale"] or not old_st.get("scale"):
             return
         ratio = st["scale"] / old_st["scale"]
-        rink_len, rink_wid = st["rink_len"], 20.0
+        rink_len, rink_wid = st["rink_len"], st.get("rink_wid", 20.0)
 
         seen = set()
         for token in list(self.tokens.values()):
@@ -6460,6 +8085,10 @@ class FloorballTacticsApp:
                 self.canvas.coords(cid, *new_coords)
             except Exception:
                 pass
+        # The drawings now sit at new pixel coordinates; what the animation restores
+        # them to has to follow, or the first Play after a resize would drag every
+        # arrow back to where the window used to be.
+        self._sync_full_coords()
 
     def _rink_to_px(self, mx, my):
         """Rink-space metres -> canvas pixels, matching _draw_pitch's m2px."""
@@ -6469,42 +8098,126 @@ class FloorballTacticsApp:
         """The centre spot. On a half rink the halfway line is the open edge at
         mx = 0, so the spot sits at the middle of that edge -- i.e. the centre of
         the halfway semicircle, not the middle of the visible board."""
-        return self._rink_to_px(0.0 if self.half_rink_var.get() else 20.0, 10.0)
+        rink_len, rink_wid = self._rink_size()
+        return self._rink_to_px(0.0 if self.half_rink else rink_len / 2.0,
+                                rink_wid / 2.0)
 
     def _pitch_center_px(self):
-        rink_len = 20.0 if self.half_rink_var.get() else 40.0
-        rink_wid = 20.0
+        rink_len, rink_wid = self._rink_size()
         # When rotated the rink's long axis runs down the canvas, so the pixel spans
         # swap over -- using the landscape spans puts the centre off the pitch.
         span_x, span_y = (rink_wid, rink_len) if self.rink_rotated else (rink_len, rink_wid)
         return (self.pitch_ox + span_x * self.pitch_scale / 2,
                 self.pitch_oy + span_y * self.pitch_scale / 2)
 
+    # ----------------------
+    # Fixtures of the rink
+    # ----------------------
+    PITCH_PART_NAMES = {
+        "boards": "Boards",
+        "centre_line": "Centre line",
+        "centre_circle": "Centre circle",
+        "goal_left": "Goal",
+        "goal_right": "Goal",
+    }
+
+    def _part_tags(self, key):
+        """Tags for one removable fixture of the rink.
+
+        The name is carried in a tag rather than held as a canvas id because every
+        redraw makes new items: after a resize the ids that were deleted would name
+        nothing, while the name still finds whatever was drawn in their place."""
+        return ("pitch", "pitch_part", f"part:{key}")
+
+    def pitch_part_label(self, key):
+        """What to call a fixture in a menu."""
+        if str(key).startswith("faceoff_"):
+            return "Face-off cross"
+        return self.PITCH_PART_NAMES.get(key, "Rink feature")
+
+    def _pitch_part_at(self, x, y, reach=4):
+        """The fixture under the pointer, or None. Topmost first, so a cross sitting
+        on the boards is picked before the boards are."""
+        try:
+            items = self.canvas.find_overlapping(x - reach, y - reach,
+                                                 x + reach, y + reach)
+        except Exception:
+            return None
+        for cid in reversed(items):
+            for tag in self.canvas.gettags(cid):
+                if tag.startswith("part:"):
+                    key = tag[5:]
+                    if key not in self.hidden_pitch_parts:
+                        return key
+        return None
+
+    def _apply_hidden_pitch_parts(self):
+        """Show every fixture, then take out the ones that were deleted."""
+        try:
+            self.canvas.itemconfigure("pitch_part", state=tk.NORMAL)
+        except Exception:
+            pass
+        for key in self.hidden_pitch_parts:
+            try:
+                self.canvas.itemconfigure(f"part:{key}", state=tk.HIDDEN)
+            except Exception:
+                pass
+
+    def _highlight_pitch_parts(self):
+        """Mark selected fixtures with the same dashed box the rest of the selection
+        gets. No resize handles: a goal is where the rules put it."""
+        for key in self.selected_pitch_parts:
+            box = self.canvas.bbox(f"part:{key}")
+            if not box:
+                continue
+            rect = self.canvas.create_rectangle(box[0] - 3, box[1] - 3,
+                                                box[2] + 3, box[3] + 3,
+                                                outline=self.C_ACCENT, width=2,
+                                                dash=(4, 3), tags=("selection_overlay",))
+            self.selection_overlay_ids.append(rect)
+
+    def restore_pitch_parts(self):
+        """Put every deleted fixture of the rink back."""
+        if not self.hidden_pitch_parts:
+            return
+        self.push_command(HidePitchPartsCommand(self, set(self.hidden_pitch_parts),
+                                                hide=False))
+
     def _draw_pitch(self):
         self.canvas.delete("pitch")
         w, h = self.width, self.height
-        is_half = self.half_rink_var.get()
-        
-        rink_len = 20.0 if is_half else 40.0
-        rink_wid = 20.0
-        corner_r = 2.0
+        is_half = self.half_rink
+
+        rink_len, rink_wid = self._rink_size()
+        marks = self._rink_markings()
+        corner_r = marks["corner_r"]
         
         margin = 35
         avail_w = w - (margin * 2)
         avail_h = h - (margin * 2)
         
+        # The rink is fitted to the canvas and then multiplied by the zoom, and stays
+        # centred either way -- so zooming in enlarges what is in the middle of the
+        # board rather than pushing the rink into a corner.
+        zoom = self.zoom
         if self.rink_rotated:
-            scale = min(avail_w / rink_wid, avail_h / rink_len)
+            scale = min(avail_w / rink_wid, avail_h / rink_len) * zoom
             ox = (w - rink_wid * scale) / 2
             oy = (h - rink_len * scale) / 2
             def m2px(mx, my):
                 return ox + my * scale, oy + (rink_len - mx) * scale
         else:
-            scale = min(avail_w / rink_len, avail_h / rink_wid)
+            scale = min(avail_w / rink_len, avail_h / rink_wid) * zoom
             ox = (w - rink_len * scale) / 2
             oy = (h - rink_wid * scale) / 2
             def m2px(mx, my):
                 return ox + mx * scale, oy + my * scale
+        # Scrolling shifts the origin. It is clamped to what is actually off-screen,
+        # so the rink can never be scrolled away from under the pointer, and at 1x
+        # there is nothing hidden and therefore nothing to scroll.
+        self._clamp_pan(w, h, rink_len, rink_wid, scale)
+        ox += self.pan_x
+        oy += self.pan_y
 
         self.pitch_scale = scale
         self.pitch_ox = ox
@@ -6540,79 +8253,89 @@ class FloorballTacticsApp:
         br_x2, br_y2 = m2px(rink_len, rink_wid)
         self.canvas.create_arc(br_x1, br_y1, br_x2, br_y2, start=corner_start["br"], extent=90, fill="#ffffff", outline="", tags=("pitch", "pitch_surface"))
 
+        boards = self._part_tags("boards")
         lt1_x, lt1_y = m2px(corner_r, 0)
         lt2_x, lt2_y = m2px(rink_len - corner_r, 0)
-        self.canvas.create_line(lt1_x, lt1_y, lt2_x, lt2_y, fill="#343a40", width=2.5, tags="pitch")
+        self.canvas.create_line(lt1_x, lt1_y, lt2_x, lt2_y, fill="#343a40", width=2.5, tags=boards)
 
         lb1_x, lb1_y = m2px(corner_r, rink_wid)
         lb2_x, lb2_y = m2px(rink_len - corner_r, rink_wid)
-        self.canvas.create_line(lb1_x, lb1_y, lb2_x, lb2_y, fill="#343a40", width=2.5, tags="pitch")
+        self.canvas.create_line(lb1_x, lb1_y, lb2_x, lb2_y, fill="#343a40", width=2.5, tags=boards)
 
         ll1_x, ll1_y = m2px(0, corner_r)
         ll2_x, ll2_y = m2px(0, rink_wid - corner_r)
-        self.canvas.create_line(ll1_x, ll1_y, ll2_x, ll2_y, fill="#343a40", width=2.5, tags="pitch")
+        self.canvas.create_line(ll1_x, ll1_y, ll2_x, ll2_y, fill="#343a40", width=2.5, tags=boards)
 
         lr1_x, lr1_y = m2px(rink_len, corner_r)
         lr2_x, lr2_y = m2px(rink_len, rink_wid - corner_r)
-        self.canvas.create_line(lr1_x, lr1_y, lr2_x, lr2_y, fill="#343a40", width=2.5, tags="pitch")
+        self.canvas.create_line(lr1_x, lr1_y, lr2_x, lr2_y, fill="#343a40", width=2.5, tags=boards)
 
-        self.canvas.create_arc(tl_x1, tl_y1, tl_x2, tl_y2, start=corner_start["tl"], extent=90, style=tk.ARC, outline="#343a40", width=2.5, tags="pitch")
-        self.canvas.create_arc(tr_x1, tr_y1, tr_x2, tr_y2, start=corner_start["tr"], extent=90, style=tk.ARC, outline="#343a40", width=2.5, tags="pitch")
-        self.canvas.create_arc(bl_x1, bl_y1, bl_x2, bl_y2, start=corner_start["bl"], extent=90, style=tk.ARC, outline="#343a40", width=2.5, tags="pitch")
-        self.canvas.create_arc(br_x1, br_y1, br_x2, br_y2, start=corner_start["br"], extent=90, style=tk.ARC, outline="#343a40", width=2.5, tags="pitch")
+        self.canvas.create_arc(tl_x1, tl_y1, tl_x2, tl_y2, start=corner_start["tl"], extent=90, style=tk.ARC, outline="#343a40", width=2.5, tags=boards)
+        self.canvas.create_arc(tr_x1, tr_y1, tr_x2, tr_y2, start=corner_start["tr"], extent=90, style=tk.ARC, outline="#343a40", width=2.5, tags=boards)
+        self.canvas.create_arc(bl_x1, bl_y1, bl_x2, bl_y2, start=corner_start["bl"], extent=90, style=tk.ARC, outline="#343a40", width=2.5, tags=boards)
+        self.canvas.create_arc(br_x1, br_y1, br_x2, br_y2, start=corner_start["br"], extent=90, style=tk.ARC, outline="#343a40", width=2.5, tags=boards)
 
+        # The halfway line sits at the middle of whatever field is being drawn; a half
+        # rink has none, because its open edge is the halfway line.
+        halfway_mx = 0.0 if is_half else rink_len / 2.0
+        mid_wid = rink_wid / 2.0
         if not is_half:
             # Both endpoints must go through m2px in full: when rotated, the x of a
             # pixel depends only on my and the y only on mx, so mixing components
             # from two different m2px calls collapses the line to zero length.
-            cl1_x, cl1_y = m2px(20.0, 0)
-            cl2_x, cl2_y = m2px(20.0, 20.0)
-            self.canvas.create_line(cl1_x, cl1_y, cl2_x, cl2_y, fill="#ced4da", width=2, tags="pitch")
+            cl1_x, cl1_y = m2px(halfway_mx, 0)
+            cl2_x, cl2_y = m2px(halfway_mx, rink_wid)
+            self.canvas.create_line(cl1_x, cl1_y, cl2_x, cl2_y, fill="#ced4da", width=2,
+                                    tags=self._part_tags("centre_line"))
 
         # On a half rink the local mx axis spans only one half of the 40 m rink: the
         # goal end is at mx = rink_len and the halfway line is the open edge at
         # mx = 0. Placing the centre circle at mx = 20 (correct for a full rink) put
         # it on the goal end wall, overlapping the cage and goal areas.
-        cc_px, cc_py = m2px(0.0 if is_half else 20.0, 10.0)
-        c_radius_px = 3.0 * scale
-        if is_half:
-            # The semicircle has to open into the rink. Rotating the rink turns the
-            # whole mapping 90 deg, so the arc's start angle turns with it.
-            self.canvas.create_arc(
-                cc_px - c_radius_px, cc_py - c_radius_px,
-                cc_px + c_radius_px, cc_py + c_radius_px,
-                start=(0 if self.rink_rotated else 270), extent=180,
-                outline="#ced4da", width=2, style=tk.ARC, tags="pitch"
-            )
-        else:
-            self.canvas.create_oval(
-                cc_px - c_radius_px, cc_py - c_radius_px,
-                cc_px + c_radius_px, cc_py + c_radius_px,
-                outline="#ced4da", width=2, tags="pitch"
-            )
+        # The small fields have a centre point but no circle, so there is nothing to
+        # draw here for them -- the centre mark is one of the face-off spots below.
+        cc_px, cc_py = m2px(halfway_mx, mid_wid)
+        if marks["circle"]:
+            c_radius_px = marks["circle"] * scale
+            if is_half:
+                # The semicircle has to open into the rink. Rotating the rink turns the
+                # whole mapping 90 deg, so the arc's start angle turns with it.
+                self.canvas.create_arc(
+                    cc_px - c_radius_px, cc_py - c_radius_px,
+                    cc_px + c_radius_px, cc_py + c_radius_px,
+                    start=(0 if self.rink_rotated else 270), extent=180,
+                    outline="#ced4da", width=2, style=tk.ARC,
+                    tags=self._part_tags("centre_circle")
+                )
+            else:
+                self.canvas.create_oval(
+                    cc_px - c_radius_px, cc_py - c_radius_px,
+                    cc_px + c_radius_px, cc_py + c_radius_px,
+                    outline="#ced4da", width=2, tags=self._part_tags("centre_circle")
+                )
 
-        goal_line_dist = 2.85
-        cage_depth = 0.65
-        cage_width = 1.6
-        small_depth = 1.0
-        small_width = 2.5
-        large_depth = 4.0
-        large_width = 5.0
-        
+        goal_line_dist = marks["goal_line"]
+        cage_depth = self.GOAL_DEPTH_M
+        cage_width = self.GOAL_MOUTH_M
+
         def draw_goal_end(goal_line_x, is_left):
+            # The cage, its goal line and the two goal areas are one part: they are
+            # one piece of furniture, and picking them off separately would be
+            # fiddlier than it is worth.
+            goal = self._part_tags("goal_left" if is_left else "goal_right")
             # Take both endpoints straight from m2px; taking the x from one call and
             # the y from another only happens to work in the landscape mapping and
             # degenerates to a zero-length line once the rink is rotated.
-            gl1_x, gl1_y = m2px(goal_line_x, 10.0 - (cage_width/2))
-            gl2_x, gl2_y = m2px(goal_line_x, 10.0 + (cage_width/2))
-            self.canvas.create_line(gl1_x, gl1_y, gl2_x, gl2_y, fill="#000000", width=2.5, tags="pitch")
+            gl1_x, gl1_y = m2px(goal_line_x, mid_wid - (cage_width/2))
+            gl2_x, gl2_y = m2px(goal_line_x, mid_wid + (cage_width/2))
+            self.canvas.create_line(gl1_x, gl1_y, gl2_x, gl2_y, fill="#000000", width=2.5, tags=goal)
 
             # The cage is a solid black box. It is built as a polygon from four
             # rink-space corners rather than as an axis-aligned rectangle so it stays
             # correct at either end of the rink and in either orientation.
             back_x = goal_line_x - cage_depth if is_left else goal_line_x + cage_depth
-            cage_y1 = 10.0 - (cage_width / 2)
-            cage_y2 = 10.0 + (cage_width / 2)
+            cage_y1 = mid_wid - (cage_width / 2)
+            cage_y2 = mid_wid + (cage_width / 2)
             cage_pts = [
                 m2px(goal_line_x, cage_y1),
                 m2px(back_x, cage_y1),
@@ -6620,44 +8343,53 @@ class FloorballTacticsApp:
                 m2px(goal_line_x, cage_y2),
             ]
             flat = [c for pt in cage_pts for c in pt]
-            self.canvas.create_polygon(*flat, fill="#000000", outline="#000000", width=1, tags="pitch")
+            self.canvas.create_polygon(*flat, fill="#000000", outline="#000000", width=1, tags=goal)
 
-            small_x1 = goal_line_x if is_left else goal_line_x - small_depth
-            small_x2 = goal_line_x + small_depth if is_left else goal_line_x
-            sx1, sy1 = m2px(small_x1, 10.0 - (small_width/2))
-            sx2, sy2 = m2px(small_x2, 10.0 + (small_width/2))
-            self.canvas.create_rectangle(sx1, sy1, sx2, sy2, outline="#ced4da", width=2, tags="pitch")
-
-            large_x1 = goal_line_x if is_left else goal_line_x - large_depth
-            large_x2 = goal_line_x + large_depth if is_left else goal_line_x
-            lx1, ly1 = m2px(large_x1, 10.0 - (large_width/2))
-            lx2, ly2 = m2px(large_x2, 10.0 + (large_width/2))
-            self.canvas.create_rectangle(lx1, ly1, lx2, ly2, outline="#ced4da", width=2, tags="pitch")
+            # One box on the small fields (the goalkeeper area), two on the large one
+            # (the goal crease and the goal area around it).
+            for depth, width in marks["areas"]:
+                area_x1 = goal_line_x if is_left else goal_line_x - depth
+                area_x2 = goal_line_x + depth if is_left else goal_line_x
+                ax1, ay1 = m2px(area_x1, mid_wid - (width/2))
+                ax2, ay2 = m2px(area_x2, mid_wid + (width/2))
+                self.canvas.create_rectangle(ax1, ay1, ax2, ay2, outline="#ced4da",
+                                             width=2, tags=goal)
 
         if self.goals_visible_var.get():
             if is_half:
-                draw_goal_end(20.0 - goal_line_dist, False)
+                draw_goal_end(rink_len - goal_line_dist, False)
             else:
                 draw_goal_end(goal_line_dist, True)
-                draw_goal_end(40.0 - goal_line_dist, False)
+                draw_goal_end(rink_len - goal_line_dist, False)
 
-        # Face-off crosses: the four corner spots plus the three on the halfway line
-        # (including the centre spot). Every one of them is set in from the boards by
-        # the same 2.85 m that separates a goal line from the end wall. On a half rink
-        # the halfway line is the open edge at mx = 0 and only one end exists.
+        # Face-off crosses: the corner spots plus the ones on the halfway line,
+        # including the centre spot. How far they sit in from the long sides differs
+        # per field -- 2.85 m on the large rink, 2 m on the 3v3 field, 1 m on the
+        # small one -- while along the rink they line up with the goal lines. On a
+        # half rink the halfway line is the open edge at mx = 0 and only one end
+        # exists.
         cross_arm = 0.25
+        inset = marks["faceoff"]
         if is_half:
             halfway_x, end_xs = 0.0, [rink_len - goal_line_dist]
         else:
-            halfway_x, end_xs = 20.0, [goal_line_dist, rink_len - goal_line_dist]
+            halfway_x = rink_len / 2.0
+            end_xs = [goal_line_dist, rink_len - goal_line_dist]
 
         faceoff_spots = []
         for end_x in end_xs:
-            faceoff_spots.append((end_x, goal_line_dist))
-            faceoff_spots.append((end_x, rink_wid - goal_line_dist))
-        faceoff_spots.append((halfway_x, goal_line_dist))
-        faceoff_spots.append((halfway_x, rink_wid - goal_line_dist))
-        faceoff_spots.append((halfway_x, rink_wid / 2))
+            faceoff_spots.append((end_x, inset))
+            faceoff_spots.append((end_x, rink_wid - inset))
+        faceoff_spots.append((halfway_x, inset))
+        faceoff_spots.append((halfway_x, rink_wid - inset))
+        faceoff_spots.append((halfway_x, mid_wid))
+
+        # The small fields put a penalty spot in front of each goal instead of the
+        # large rink's extra face-off circles.
+        if marks["penalty"]:
+            for goal_x, inward in ((goal_line_dist, 1.0),
+                                   (rink_len - goal_line_dist, -1.0)):
+                faceoff_spots.append((goal_x + inward * marks["penalty"], mid_wid))
 
         for spot_x, spot_y in faceoff_spots:
             # Diagonal arms: a face-off mark is an X, not a +.
@@ -6665,13 +8397,43 @@ class FloorballTacticsApp:
             se = m2px(spot_x + cross_arm, spot_y + cross_arm)
             sw = m2px(spot_x - cross_arm, spot_y + cross_arm)
             ne = m2px(spot_x + cross_arm, spot_y - cross_arm)
-            self.canvas.create_line(*nw, *se, fill="#000000", width=2, tags="pitch")
-            self.canvas.create_line(*sw, *ne, fill="#000000", width=2, tags="pitch")
+            cross = self._part_tags(f"faceoff_{spot_x:.1f}_{spot_y:.1f}")
+            self.canvas.create_line(*nw, *se, fill="#000000", width=2, tags=cross)
+            self.canvas.create_line(*sw, *ne, fill="#000000", width=2, tags=cross)
+
+        # Substitution zones: a marked stretch of one long side, one per team, either
+        # side of the halfway line. Drawn on the boards themselves, which is where the
+        # tape goes.
+        if marks["sub_zone"] and not is_half:
+            start, length = marks["sub_zone"]
+            zones = self._part_tags("sub_zones")
+            for direction in (-1.0, 1.0):
+                near = halfway_x + direction * start
+                far = near + direction * length
+                z1_x, z1_y = m2px(min(near, far), rink_wid)
+                z2_x, z2_y = m2px(max(near, far), rink_wid)
+                self.canvas.create_line(z1_x, z1_y, z2_x, z2_y, fill="#f59f00",
+                                        width=5, tags=zones)
 
         self.draw_grid_points()
 
+        # The rink has just been rebuilt, so anything the user removed has to be
+        # taken back out of it.
+        self._apply_hidden_pitch_parts()
         self.canvas.tag_lower("pitch")
+        self._draw_credit()
         self._render_watermark()
+
+    def _draw_credit(self):
+        """The authorship line in the bottom-left corner of the board.
+
+        Drawn on the canvas rather than packed into the chrome so it comes along with
+        an exported frame, and left out of drawn_items so it cannot be selected,
+        dragged or deleted with the rest of the board."""
+        self.canvas.delete("credit")
+        self.canvas.create_text(
+            10, max(0, self.height - 8), text=self.CREDIT_TEXT, anchor="sw",
+            fill="#adb5bd", font=(self.UI_FONT, 8), tags=("credit",))
 
 if __name__ == "__main__":
     root = tk.Tk()
