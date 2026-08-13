@@ -2,7 +2,7 @@
 
 Floorball Tactics Studio is an interactive desktop application built with Python and Tkinter for creating, editing, animating, and presenting floorball tactical diagrams. It is designed for coaches, analysts, and players who need to visualize player movement, passing sequences, offensive and defensive positioning, and complete tactical plays.
 
-The application combines an interactive tactical board with a command-based architecture that supports undo/redo, macro recording, keyframe animation, and animated GIF export.
+The application combines an interactive tactical board with a command-based architecture that supports undo/redo, macro recording, grouped keyframe animation, and animated GIF export.
 
 ---
 
@@ -14,7 +14,7 @@ The application combines an interactive tactical board with a command-based arch
   - [Interactive Playing Surface](#interactive-playing-surface)
   - [Player and Ball Management](#player-and-ball-management)
   - [Tactical Drawing Tools](#tactical-drawing-tools)
-  - [Signs, Text, and Images](#signs-text-and-images)
+  - [Shapes, Text, and Images](#shapes-text-and-images)
   - [Tactics](#tactics)
   - [Timeline and Animation](#timeline-and-animation)
   - [Watermark](#watermark)
@@ -45,9 +45,9 @@ python3 floorball_studio/floorball_animator.py
 Then, to build your first play:
 
 1. Pick a formation for each team in **Tactics**, set the percentage, press **Apply**.
-2. Drag a player where you want them. The drag is recorded in the timeline and becomes an animation step.
-3. Draw a pass with the **Pass** tool — with **Snap Plr** on, the ends attach to the players.
-4. Press **Play** in the timeline to watch it, or **Export** in General to write a GIF.
+2. Drag the players into the exact positions you want to start from. This is **group 0** — the stage the animation begins at, not something it plays through.
+3. Press **Add Group** to close it. Everything you do next — moving players, drawing a pass, stamping a sign — joins the new group and will happen *at the same time* when it plays.
+4. Press **Play** to watch it, or **Export** in General to write a GIF.
 5. **Save** writes the whole thing — board, drawings, watermark, command log — to one JSON file.
 
 ---
@@ -60,12 +60,12 @@ The toolbar is always exactly two rows of boxes, with the timeline spanning both
 |-----|----------|
 | **General** | Undo, Redo, Save, Export · Load, Watermark, Reset, Prefs |
 | **Board Settings** | Full/Half, Arches, Goals, Snap Plr · Snap Ang, Snap Grd, Ghosting, Rotate |
-| **Roster** | Attack count, shape, colour, player size · Defence count, shape, colour |
+| **Roster** | Attack: count, shape, colour · Defence: count, shape, colour · player size in its own column |
 | **Tactics** | Attack: percentage, formation, Apply · Defence: percentage, formation, Apply |
 | **Align & Distribute** | Align H, Align V · Dist H, Dist V · Group, Lock |
-| **Signs** | Sign size and colour · Goal, X, Ball · Square, Triangle, Plus · Text, Image, text size |
+| **Shapes** | Goal, X, Ball · Square, Triangle, Plus · Text, Image, Size + colour |
 | **Drawing Tools** | Select, Pass, Shot, Dribble, Run · Line, Bend, Box, Rect, Circle, Oval · Rotate Sel, Copy Style, Default, Delete · line type, thickness, colour |
-| **Timeline** | The step list, and Add Step / Play / Pause / Stop / Up / Down / Del Step, with the Time slider |
+| **Timeline** | The group tree, the Time slider, and Play / Pause / Stop / Add Group / Del Group / Up / Down |
 
 Every button carries a tooltip describing what it does; hover for about half a second.
 
@@ -90,8 +90,10 @@ A menu bar above the toolbar holds **Edit** (copy, cut, paste, select all), **Vi
 - Each player is drawn in three layers — fill, a thin dark edge, and a white ring outside it — so tokens stay legible over goal areas and on top of drawn lines.
 - Selecting, moving, rotating (45° steps about the player's own centroid), grouping, and locking.
 - Player size can be changed for the selection, or — with nothing selected — for every player at once. Tactical role labels survive a resize.
+- Changing a team's **colour, shape or count** leaves the players exactly where they stand, with their roles and the undo history intact.
 - **Ghosting** leaves a faded copy of a player where a drag began. Ghosts belong to the move that created them: one undo takes back the movement and the ghost together. Switching Ghosting off sweeps the board, and the right-click menu offers **Clear Ghosts**.
-- **Snap Plr** attaches drawn line ends to nearby players, and snaps the **ball** to the middle of the nearest player edge — never to the centre, because a ball on a player's middle reads as them standing on it. The catch radius grows with the player, so large tokens are no harder to hit than small ones.
+- **Snap Plr** attaches drawn line ends to nearby players and snaps the **ball** to the middle of the nearest player edge — never to the centre, because a ball on a player's middle reads as them standing on it. The snap box comes from the player's *size* rather than the box each shape happens to paint, so a circle, square, triangle, X and plus of the same size all snap identically.
+- Dragging a player **releases** an arrow snapped to it — repositioning a player is not a redraw of the play. Hold **Shift** while dragging and the arrow travels with them.
 
 ### Tactical Drawing Tools
 
@@ -103,20 +105,22 @@ A menu bar above the toolbar holds **Edit** (copy, cut, paste, select all), **Vi
 | **Run** | Solid directional arrow |
 | **Line** | Plain straight line |
 | **Bend** | A curve — click the start, the bend, then the end |
-| **Box** / **Rect** | Filled box / rectangle outline |
+| **Box** / **Rect** | Square outline / rectangle outline |
 | **Circle** / **Oval** | Circle / oval |
 
 - Line type (Solid, Dashed, Dotted, Pass, Shot, Dribble, Run), thickness, and colour are configurable.
+- Shapes are **outline only**; nothing is filled by default, and selecting or deselecting them does not fill them in.
 - **Bends stay editable.** Select a curve and an orange handle appears on its control point — drag it to reshape the arc while both ends stay exactly where you put them. With Arches on, a bend is drawn as two offset curves and both halves move together.
 - **Snap Ang** constrains new lines to 45° angles.
 - **Copy Style** picks up one player's colour and shape, then applies it to others by clicking them.
+- **Delete** removes the selection — players, signs, lines, labels and pictures alike.
 
-### Signs, Text, and Images
+### Shapes, Text, and Images
 
 - Stamp markers: **Goal, X, Ball, Square, Triangle, Plus**. The Goal sign always matches the size of the goals drawn on the rink, and turns with it. The Ball is drawn as a floorball — a body with three holes, which keep the rink's colour rather than the sign's.
 - Place **text labels** anywhere: pick the Text tool, click the board, type.
 - Place **images** on the board — movable, and scalable by their corner handles, which re-render the bitmap rather than just stretching its anchor point.
-- One **Size** field and one **colour** apply to both signs and text. Changing the size restamps the selected signs and retypes the selected labels; the separate Txt field remains for text-only adjustment (6–96 pt).
+- One **Size** dial and one **colour** serve the whole box. Changing the size restamps the selected signs, retypes the selected labels, and sets the size a new label is typed at.
 
 ### Tactics
 
@@ -131,30 +135,37 @@ Two formation pickers — one for attackers, one for defenders — each with a p
 | Square | LD, RD, LA, RA | 4 |
 | Diamond | P, LW, RW, T | 4 |
 
-Applying a four-player formation drops the team to four players; a five-player formation brings the fifth back. Slots are stored unitless — across (0 = left, 1 = right) and depth (0 = rearmost, 1 = most advanced), both measured in the team's own attacking direction — so one table serves either team, either rink orientation, and the half rink.
+Applying a four-player formation drops the team to four players; a five-player formation brings the fifth back. Slots are stored unitless — across (0 = left, 1 = right) and depth (0 = rearmost, 1 = most advanced), both measured in the team's own attacking direction — so one table serves either team, either rink orientation, and the half rink. House puts its defenders out by the boards rather than tucked in beside each other, which is what makes the shape read as a house.
 
-Each player keeps its **role label** (LD, RW, T …) on the token, while its internal identity (A1…A5, D1…D5) stays fixed so undo, macros, and lookups keep working.
+Each player keeps its **role label** (LD, RW, T …) on the token, while its internal identity (A1…A5, D1…D5) stays fixed so undo, macros, and lookups keep working. The timeline names players the way the rink does, so a step reads `Move LD, RD` rather than `Move A1, A2`.
 
 ### Timeline and Animation
 
-The timeline and the animation are the same list. Every action that changes the board — a drag, a formation, a drawing — becomes a step, named after the action that made it and carrying its own time interval:
+The timeline and the animation are the same thing: a tree of **groups**. A group is a set of actions that happen **at the same time** when the animation plays.
 
 ```text
-0  Start                                    2.0s
-1  Move A1 (+60,+30)                        2.0s
-2  Attack Umbrella 60% [P, LW, RW, C, T]    2.0s
-3  Step 3                                   2.0s
+▾ 0  Group 0                             2.0s
+       Move RD
+       Pass
+▾ 1  Breakout                            1.0s
+       Move LD
+       Move LW
+       Sign Goal
 ```
 
-- **Add Step** freezes the board as a keyframe. The first one also records the opening slide, step 0, so there is always something to move *from*.
-- **Play / Pause / Stop** — playback interpolates positions in rink metres at 25 fps, so it is correct at any window size and in either orientation. Pause keeps its place; Play resumes from there; Stop rewinds to the opening slide.
-- A **red row** marks the step playback starts from. Click any step to move it.
-- **Up / Down** and drag-and-drop reorder steps, carrying each step's board with it and renumbering from the top.
-- **Double-click** a step to give it its own duration; the **Time** slider retimes them all.
-- **Del Step** removes the step under the playhead.
+- Group headings are **bold**, and every group can be **collapsed and expanded**. A redraw remembers which ones you had folded.
+- **Group 0 is the board as it stands.** Arranging players is setup, not choreography — the animation begins at the arrangement instead of playing back how you reached it.
+- Moves, formations, arrows, signs, labels and images all join the **open** group. **Add Group** closes it and starts the next one.
+- **Double-click a group** to give it a name of your own and its own time in one dialog. A name you set is never overwritten by the next action that joins the group.
+- The **Time** slider retimes every group at once, and reaches **0 s** — a group at zero is an instant cut to the next one.
+- A **red row** marks the group playback starts from. Click any row to move it.
+- **Up / Down** and dragging a group row reorder the sequence. Dragging one of the *action* rows drops that action into whichever group you release it over.
+- **Del Group** removes the group under the playhead, leaving the others' names untouched.
+- **Play / Pause / Stop** — playback interpolates positions in rink metres at 25 fps, so it is correct at any window size and in either orientation. Pause keeps its place; Play resumes from there; Stop rewinds to group 0.
+- Drawings take part: anything from a later group stays hidden until the animation reaches it, and a line belonging to the group being entered is **drawn on** over that group's time, following its own length so a curve follows its curve.
 - **Export** writes the sequence to an animated GIF by walking the board through every frame and capturing the canvas, so what is exported is what is on screen.
 
-Playing or exporting without at least two steps, or with a step whose time is zero, raises a warning rather than doing nothing.
+Playing or exporting with fewer than two groups, or with every group at zero seconds, raises a warning rather than doing nothing.
 
 ### Watermark
 
@@ -175,7 +186,7 @@ The image travels inside the macro file as lossless base64 PNG, so a saved tacti
 - Horizontal and vertical alignment; equal horizontal and vertical distribution.
 - Group and ungroup; lock and unlock. Locked players cannot be moved, resized, or deleted.
 - Rotate the selection in 45° steps — players and signs alike.
-- Resize handles on a selection; corner drags scale the contents.
+- Resize handles on a selection; corner drags scale the contents, including the bitmap of a placed image.
 - **Right-click menus**:
 
 | Right-click on | Menu |
@@ -212,7 +223,7 @@ Other appearance behaviour:
 
 The application uses a command-based architecture that records editing operations. Each operation can be undone (`Ctrl + Z`), redone (`Ctrl + Y`), serialized into a JSON macro, and replayed later.
 
-Undo takes back everything an action produced — the movement, the ghost it left, the timeline line, and the animation keyframe — as one step.
+Undo takes back everything an action produced — the movement, the ghost it left, its line in the group, and the drawing it made — as one step. Undoing one action inside a group leaves the group in place and simply removes that action from it.
 
 ---
 
@@ -222,9 +233,9 @@ Undo takes back everything an action produced — the movement, the ghost it lef
 
 1. Set the roster: team sizes, shapes, colours.
 2. Apply a formation to each team, adjusting the percentage until the shape sits where you want it.
-3. Drag players into their exact positions. Each drag becomes a timeline step and an animation keyframe.
-4. Draw passes, shots, runs and dribbles between them.
-5. Reorder or retime steps in the timeline until the sequence plays the way you coach it.
+3. Drag players into their exact starting positions. This is group 0, the stage the animation opens on.
+4. Press **Add Group**, then make the first phase happen: move the players involved, draw the pass, stamp a mark. All of it plays together.
+5. Repeat for each phase. Rename and retime groups by double-clicking them.
 6. **Save** to JSON, or **Export** to GIF.
 
 ### Reusing a play
@@ -265,12 +276,12 @@ The application follows the **Command Pattern**, allowing editing operations to 
 
 | Command | Records |
 |---------|---------|
-| `MoveTokensCommand` | Relative movement (`dx`, `dy`) for one or more tokens, plus any ghosts the move left behind and the timeline/animation step it produced. |
+| `MoveTokensCommand` | Relative movement (`dx`, `dy`) for one or more tokens, whether lines attached to them travel too, any ghosts the move left behind, and the group entry it produced. |
 | `ApplyTacticCommand` | A formation change: the team, the shape, the percentage, each player's new role, and the movement itself. |
-| `DrawLineCommand` | Drawing coordinates together with the selected tactical tool. |
+| `DrawLineCommand` | Drawing coordinates together with the selected tactical tool, and the group the drawing belongs to. |
 | `MoveDrawnCommand` | Movement of drawn items (signs, lines, text, images). |
 | `RotateTokensCommand` | Rotation of players about their own centroid. |
-| `RotateDrawnCommand` | Rotation of drawn items about the centre of the selection. |
+| `RotateDrawnCommand` | Rotation of drawn items about the centre of the selection, with the pivot recorded so undo turns back about the same point. |
 | `GroupCommand` | Creation or removal of token groups. |
 | `LockCommand` | The locked state of tokens. |
 | `SetWatermarkCommand` | The watermark image, its placement, and its crop/background/opacity settings. |
@@ -292,10 +303,11 @@ This is what lets a macro saved in one window size load correctly into another, 
 
 A player is not one canvas item but several: the coloured shape, a white ring, a dark edge, and up to nine text items that give the label its outline. An X or a Plus is a set of strokes. Anything that moves, rotates, scales, or deletes a player therefore acts on the whole set.
 
-Two Tk details shape the code:
+Three Tk details shape the code:
 
-- `canvas.coords()` returns a bounding box only for ovals and rectangles. For a polygon it returns every vertex, and for a line every point. Reading it as a box is correct for a circle player and wrong for a square one, which is why the code uses `canvas.bbox()` throughout.
+- `canvas.coords()` returns a bounding box only for ovals and rectangles. For a polygon it returns every vertex, and for a line every point. Reading it as a box is correct for a circle player and wrong for a square one, which is why the code uses `canvas.bbox()` throughout — and why snapping uses a box derived from the player's size rather than from any single item.
 - Tk rectangles are axis-aligned by definition and cannot be rotated. Squares, triangles, and the Goal sign are therefore polygons.
+- A canvas item's colour lives in `fill`, in `outline`, or in both, depending on the shape. Each drawn item records which of the two it actually uses, so recolouring and selection highlighting never flood an outline-only shape solid.
 
 ### Toolbar layout engine
 
@@ -318,8 +330,9 @@ Sections are measured, then partitioned into rows by a dynamic-programming split
 | `Ctrl + Y`, `Ctrl + Shift + Z` | Redo |
 | `Escape` | Cancel the active tool |
 | Right-click | Context menu |
+| `Shift` + drag a player | Bring its attached lines along |
 | `Shift` + corner drag | Scale evenly |
-| Double-click a step | Set that step's own duration |
+| Double-click a group | Rename it and set its time |
 
 `Delete` and `Backspace` are ignored while the focus is in a text field, so editing a roster count or a tactic percentage never removes players from the rink.
 
@@ -332,6 +345,8 @@ Sections are measured, then partitioned into rows by a dynamic-programming split
 - **Board** — half rink, curved arches, show goals, snap players, snap angles, snap to grid, ghosting.
 - **Menu** — toolbar position (top/bottom) and rows (auto/one/two).
 - **Colours** — the theme picker, plus individual pickers for attackers, defenders, lines, and signs.
+
+The dialog applies as you go, so **Cancel** puts back every setting it changed, including the colour theme; **Save & Close** keeps them.
 
 Settings are written to `~/.floorball_tactics_config.json` as they change:
 
@@ -361,7 +376,7 @@ Settings are written to `~/.floorball_tactics_config.json` as they change:
 
 Only the theme's *name* is stored; the individual colours are saved alongside it, so a theme that a later version no longer ships falls back cleanly.
 
-**Reset** (General) clears the board back to the starting formations — drawings, signs, watermark, timeline, animation steps, undo history and clipboard all go. It asks first, because it cannot be undone: the history is part of what it clears.
+**Reset** (General) clears the board back to the starting formations — drawings, signs, watermark, timeline, animation groups, undo history and clipboard all go. It asks first, because it cannot be undone: the history is part of what it clears.
 
 ---
 
@@ -417,9 +432,9 @@ python3 floorball_studio/selfcheck.py
 ```
 
 ```text
-423/423 checks passed
+496/496 checks passed
 
-Function coverage: 178/178 (100%) of the app's functions ran
+Function coverage: 200/200 (100%) of the app's functions ran
 ```
 
 The checks are grouped into areas:
@@ -428,19 +443,19 @@ The checks are grouped into areas:
 |------|--------|
 | A. Geometry | Metre↔pixel round trips in all four rink modes |
 | B. Players | Every shape: item tracking, rotation round-trips, complete deletion |
-| C. Selection | Select all, group, lock, align, distribute, the Delete key |
-| D. Snapping | Grid, 45° angles, ball-to-edge, and the no-ops when switched off |
-| E. Signs and drawings | Every sign and tool, bend editing, text, images, size and colour |
+| C. Selection | Select all, group, lock, align, distribute, ghosts, the Delete key |
+| D. Snapping | Grid, 45° angles, ball-to-edge, identical snapping across shapes, attachment on Shift |
+| E. Shapes and drawings | Every sign and tool, bend editing, text, images, size and colour, outline-only shapes |
 | F. Tactics | Every formation: roster resize, roles, timeline entry, board bounds |
 | G. Undo and redo | Each command class round-trips; empty stacks are safe |
 | H. Macros | Board snapshots survive loading into a different window size |
 | I. Watermark | Histogram detection, keying, crop, opacity, layering, round trip |
 | J. Toolbar | Two rows at every width, nothing squeezed below its size |
 | K. Player resizing | All players, zero drift, no leftovers, labels preserved |
-| L. Config and UI | Config round trip, tooltip coverage, context menus |
+| L. Config and UI | Config round trip, roster in place, tooltip coverage, context menus |
 | M. Mouse | Real press/drag/release: move, box-select, cut/paste, draw, stamp |
-| N. Dialogs | Colour pickers, save/load, watermark, preferences — all stubbed |
-| O. Animation | Steps, times, playback, reordering, GIF export, warnings |
+| N. Dialogs | Colour pickers, save/load, watermark, preferences and its Cancel — all stubbed |
+| O. Animation | Groups, times, simultaneity, playback, reordering, GIF export, warnings |
 
 It redirects the configuration file and stubs every dialog, so a run has no side effects outside a temporary directory. It exits non-zero if anything fails, and reports which functions were never entered.
 
@@ -540,6 +555,9 @@ Ghostscript is missing. Tk cannot hand over a bitmap of a canvas directly, so ex
 **The exported GIF has no watermark or placed images.**
 Tk's canvas-to-PostScript export covers shapes and text only, not image items. The dialog says so when the export finishes.
 
+**Playing the animation shows the setup moves.**
+It should not: group 0 holds the board as it stands, so arranging the players before pressing **Add Group** is setup rather than choreography. If a move is animating that you meant as setup, it joined a later group — drag its row into group 0, or undo it and make it before the group was added.
+
 **The file picker shows no images even though the folder has some.**
 Fixed in current versions: the filter used semicolon-separated patterns, which is a Windows convention. On X11 that is one literal glob and matches nothing. Extensions are now separate patterns, with upper-case twins, because X11 globs are case-sensitive.
 
@@ -553,9 +571,9 @@ That is deliberate. The minimum is 1400 × 700, below which the toolbar cannot h
 
 ## Known Limitations
 
-- Animation steps are **not** saved into macro files. A saved tactic reopens with its board, drawings and watermark, but the animation sequence has to be rebuilt.
-- GIF export does not include watermark or placed images (see Troubleshooting).
-- Every drag adds an animation step. Use **Del Step** or drag-reorder to prune a sequence built from many small adjustments.
+- Animation groups are **not** saved into macro files. A saved tactic reopens with its board, drawings and watermark, but the sequence has to be rebuilt.
+- GIF export does not include the watermark or placed images (see Troubleshooting).
+- Moving an action into another group moves its row and its drawing, but not the board positions: a group's snapshot is the end state of everything in it, so a move's effect on player positions stays with the group it was recorded in.
 - The toolbar cannot dock to the left or right; only top and bottom.
 
 ---
