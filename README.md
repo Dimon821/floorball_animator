@@ -2,7 +2,7 @@
 
 Floorball Tactics Studio is an interactive desktop application built with Python and Tkinter for creating, editing, animating, and presenting floorball tactical diagrams. It is designed for coaches, analysts, and players who need to visualize player movement, passing sequences, offensive and defensive positioning, and complete tactical plays.
 
-The application combines an interactive tactical board with a command-based architecture that supports undo/redo, macro recording, grouped keyframe animation, and animated GIF export.
+The application combines an interactive tactical board with a command-based architecture that supports undo/redo, macro recording, grouped keyframe animation, and export to GIF, video or stills.
 
 ---
 
@@ -28,7 +28,7 @@ The application combines an interactive tactical board with a command-based arch
 - [Project Structure](#project-structure)
 - [Installation](#installation)
 - [Running the Checks](#running-the-checks)
-- [Macro File Format](#macro-file-format)
+- [Play File Format](#play-file-format)
 - [Troubleshooting](#troubleshooting)
 - [Known Limitations](#known-limitations)
 - [License](#license)
@@ -47,8 +47,8 @@ Then, to build your first play:
 1. Pick a formation for each team in **Tactics**, set the percentage, press **Apply**.
 2. Drag the players into the exact positions you want to start from. This is **group 0** — the stage the animation begins at, not something it plays through.
 3. Press **Add Group** to close it. Everything you do next — moving players, drawing a pass, stamping a sign — joins the new group and will happen *at the same time* when it plays.
-4. Press **Play** to watch it, or **Export** in General to write a GIF.
-5. **Save** writes the whole thing — board, drawings, watermark, command log — to one JSON file.
+4. Press **Play** to watch it, or **Export** in General to write a GIF, an MP4, or a PNG of whichever groups you pick.
+5. **Save** writes the whole play — board, every mark in rink metres, the watermark, and the timeline with each group's duration and start time — to one JSON file that reopens as the same play.
 
 ---
 
@@ -59,13 +59,13 @@ The toolbar is always exactly two rows of boxes, with the timeline spanning both
 | Box | Contents |
 |-----|----------|
 | **General** | Undo, Redo, Save, Export · Load, Watermark, Reset, Prefs |
-| **Board Settings** | Full/Half, Arches, Goals, Snap Plr · Snap Ang, Snap Grd, Ghosting, Rotate |
+| **Board Settings** | Rink: *field*, Rink: Half, Goals, Snap Plr · Snap Ang, Snap Grd, Ghosting, Rotate |
 | **Roster** | Attack: count, shape, colour · Defence: count, shape, colour · player size in its own column |
 | **Tactics** | Attack: percentage, formation, Apply · Defence: percentage, formation, Apply |
 | **Align & Distribute** | Align H, Align V · Dist H, Dist V · Group, Lock |
 | **Shapes** | Goal, X, Ball · Square, Triangle, Plus · Text, Image, Size + colour |
 | **Drawing Tools** | Select, Pass, Shot, Dribble, Run · Line, Bend, Box, Rect, Circle, Oval · Rotate Sel, Copy Style, Default, Delete · line type, thickness, colour |
-| **Timeline** | The group tree, the Time slider, and Play / Pause / Stop / Add Group / Del Group / Up / Down |
+| **Timeline** | The group tree, the Time slider, and Play / Pause / Stop / Add Group / Delete / Up / Down |
 
 Every button carries a tooltip describing what it does; hover for about half a second.
 
@@ -77,11 +77,21 @@ A menu bar above the toolbar holds **Edit** (copy, cut, paste, select all), **Vi
 
 ### Interactive Playing Surface
 
-- Toggle between full-rink (40 × 20 m) and half-rink (20 × 20 m) views.
+- **Three fields**, named after the game they are played with and chosen with the **Rink:** button in Board Settings, which rotates through them — **5v5** → **4v4** → **3v3** → 5v5. The same choice is in Preferences as a row of radio buttons. Choosing a field also sets both teams to the number of players it is played with: **five**, **four** and **three** a side respectively. Players are added or removed where they stand, so an arrangement survives the change.
+- **The half rink** is the button beside it, **Rink: Half**, and it applies to whichever field is chosen: the board is drawn from the halfway line to one goal end, at full width. It is a view rather than a field of its own, so it leaves the number of players alone, and cycling the field keeps it.
+
+| Field | Size | Half | Goal line | Goal area | Marks in from the long side | Penalty spot | Substitution zones |
+|-------|------|------|-----------|-----------|------------------------------|--------------|--------------------|
+| **5v5** | 40 × 20 m | 20 × 20 m | 2.85 m | 1 × 2.5 m and 4 × 5 m | 2.85 m | — | — |
+| **4v4** | 27 × 15 m | 13.5 × 15 m | 1.8 m | 0.9 × 1.9 m | 1 m | 7 m | 5 m, meeting at the centre line |
+| **3v3** | 22 × 11 m | 11 × 11 m | 2.5 m | 1 × 2.5 m | 2 m | 5 m | 4 m from the centre line, 4 m long |
+
+The goal is the same on every field: **1.6 m** between the posts, 1.15 m to the crossbar, 0.65 m deep. The 3v3 figures are taken from the *NeFUB / IFF 3v3 Rules of the Game, Edition 2025* (rules 101–104); the 4v4 small-field figures from the NeFUB small-field diagram. Only the large rink has a centre circle — the 4v4 and 3v3 fields are marked with a centre point instead. A half rink has no centre line and only the far goal; its substitution zones, which straddle the centre line, are left off with it.
 - Rotate the whole rink between landscape and portrait.
-- Scaled floorball markings: boards with rounded corners, goal areas, goals, centre circle, and face-off crosses at the four corners, on the half line, and at the centre spot — all inset from the boards by the same distance as the goal line.
-- Responsive canvas that resizes with the application window. Everything on the board is stored in **rink metres**, so players, drawings, and images keep their place on the rink through a resize, a rotation, or a switch to the half rink.
+- Scaled floorball markings throughout: boards with rounded corners, goal areas, goals, the centre circle where the field has one, and face-off crosses at the corner spots, on the halfway line and at the centre spot.
+- Responsive canvas that resizes with the application window. Everything on the board is stored in **rink metres**, so players, drawings, and images keep their place on the rink through a resize, a rotation, or a switch to another field.
 - Optional grid display (15 px) with snap-to-grid positioning.
+- **The rink's own fixtures can be removed.** Click a goal, a face-off cross, the centre line, the centre circle or the boards to select it, then press Delete or use the right-click menu. Removals are remembered by name rather than by canvas item, so they survive a resize, a rotation and a switch between fields; **Undo**, **Restore Rink Features** in the right-click menu, and **Reset** all bring them back. Select All deliberately leaves them out.
 
 ### Player and Ball Management
 
@@ -110,14 +120,19 @@ A menu bar above the toolbar holds **Edit** (copy, cut, paste, select all), **Vi
 
 - Line type (Solid, Dashed, Dotted, Pass, Shot, Dribble, Run), thickness, and colour are configurable.
 - Shapes are **outline only**; nothing is filled by default, and selecting or deselecting them does not fill them in.
-- **Bends stay editable.** Select a curve and an orange handle appears on its control point — drag it to reshape the arc while both ends stay exactly where you put them. With Arches on, a bend is drawn as two offset curves and both halves move together.
+- **Bends stay editable.** Select a curve and an orange handle appears on its control point — drag it to reshape the arc while both ends stay exactly where you put them. A bend is drawn at the same weight as a straight line, and takes part in the animation like every other arrow: it is drawn on along its own curve, not along the straight line between its control points.
+- **Any line type can be bent.** The Bend tool takes whatever type is armed, so a pass, a shot, a dribble or a run can be drawn as a curve and comes out with that type's dashes, weight and arrowhead — while staying one editable curve.
 - **Snap Ang** constrains new lines to 45° angles.
 - **Copy Style** picks up one player's colour and shape, then applies it to others by clicking them.
-- **Delete** removes the selection — players, signs, lines, labels and pictures alike.
+- **Select** lights up blue whenever no other tool is armed, which is the board's select-and-move mode.
+- **Delete** removes the selection — players, signs, lines, labels and pictures alike, and **undo brings a deleted player back**, in their place, with the roster count following the board.
+- **Everything drawn stays editable.** Select any mark and drag a corner handle to resize it: signs, text labels, pictures, boxes, circles and multi-part arrows alike. The handle follows the pointer one-for-one — Shift keeps the proportions.
+- **A mark is selected whole.** Clicking one hole of a ball, one stroke of an X or one shaft of a shot picks up the entire drawing, so moving, resizing, recolouring and deleting act on the mark rather than on the piece under the pointer.
+- Arrows attached to a player keep their shape when the player carries them along. Every tool draws its arrow differently — a shot is two shafts plus a separate arrowhead, a dribble is one long wave — and each point moves in proportion to how far along the arrow it lies, so the head stays a head and the far end stays put.
 
 ### Shapes, Text, and Images
 
-- Stamp markers: **Goal, X, Ball, Square, Triangle, Plus**. The Goal sign always matches the size of the goals drawn on the rink, and turns with it. The Ball is drawn as a floorball — a body with three holes, which keep the rink's colour rather than the sign's.
+- Stamp markers: **Goal, X, Ball, Square, Triangle, Plus**. The Goal sign always matches the size of the goals drawn on the rink, and turns with it. The **Ball** is a plain filled dot.
 - Place **text labels** anywhere: pick the Text tool, click the board, type.
 - Place **images** on the board — movable, and scalable by their corner handles, which re-render the bitmap rather than just stretching its anchor point.
 - One **Size** dial and one **colour** serve the whole box. Changing the size restamps the selected signs, retypes the selected labels, and sets the size a new label is typed at.
@@ -135,7 +150,7 @@ Two formation pickers — one for attackers, one for defenders — each with a p
 | Square | LD, RD, LA, RA | 4 |
 | Diamond | P, LW, RW, T | 4 |
 
-Applying a four-player formation drops the team to four players; a five-player formation brings the fifth back. Slots are stored unitless — across (0 = left, 1 = right) and depth (0 = rearmost, 1 = most advanced), both measured in the team's own attacking direction — so one table serves either team, either rink orientation, and the half rink. House puts its defenders out by the boards rather than tucked in beside each other, which is what makes the shape read as a house.
+Applying a four-player formation drops the team to four players; a five-player formation brings the fifth back. Slots are stored unitless — across (0 = left, 1 = right) and depth (0 = rearmost, 1 = most advanced), both measured in the team's own attacking direction — so one table serves either team, either rink orientation, and any of the three fields or their halves. House puts its defenders out by the boards rather than tucked in beside each other, which is what makes the shape read as a house.
 
 Each player keeps its **role label** (LD, RW, T …) on the token, while its internal identity (A1…A5, D1…D5) stays fixed so undo, macros, and lookups keep working. The timeline names players the way the rink does, so a step reads `Move LD, RD` rather than `Move A1, A2`.
 
@@ -160,10 +175,19 @@ The timeline and the animation are the same thing: a tree of **groups**. A group
 - The **Time** slider retimes every group at once, and reaches **0 s** — a group at zero is an instant cut to the next one.
 - A **red row** marks the group playback starts from. Click any row to move it.
 - **Up / Down** and dragging a group row reorder the sequence. Dragging one of the *action* rows drops that action into whichever group you release it over.
-- **Del Group** removes the group under the playhead, leaving the others' names untouched.
+- **Delete** removes whatever the timeline has picked: a group row takes the whole group with it, an action row takes only that action out of its group — and the arrow, sign or label it stands for off the board. With nothing picked it removes the group under the playhead. Either way the other groups keep their names.
 - **Play / Pause / Stop** — playback interpolates positions in rink metres at 25 fps, so it is correct at any window size and in either orientation. Pause keeps its place; Play resumes from there; Stop rewinds to group 0.
 - Drawings take part: anything from a later group stays hidden until the animation reaches it, and a line belonging to the group being entered is **drawn on** over that group's time, following its own length so a curve follows its curve.
-- **Export** writes the sequence to an animated GIF by walking the board through every frame and capturing the canvas, so what is exported is what is on screen.
+- **An arrow snapped to a player keeps pointing at them while they run.** The attached end travels with the player through the whole group and the far end stays where the play put it. Which end is the attached one, and the line the arrow runs along, are measured from the drawing as it stands — not from the pixels the tool drew it between, which a resize, a zoom or a change of field leaves describing a line that is no longer there. On the board a plain drag still lets go of the arrow, because that is repositioning rather than choreography.
+- **An arrow drawn in the same group as a move is laid out where it will finish**, and grows from its final tail position along its final path — rather than sliding across the rink while it grows, which is what happens if both of its ends are tracked live.
+- **Export** walks the board through every frame and captures the canvas, so what is exported is what is on screen. One dialog covers every format:
+
+| | Formats | What is written |
+|---|---------|-----------------|
+| **Moving** | GIF, MP4, WebM, AVI, MOV | The whole sequence, at 25 fps |
+| **Still** | PNG, JPEG | One image per animation group you tick — a single group keeps the filename you typed, several are numbered `name_00`, `name_01`, … |
+
+  Video needs a frame writer: **imageio** (`pip install imageio imageio-ffmpeg`) or **OpenCV** (`pip install opencv-python`), whichever is present. Without either, GIF and the stills still work and the dialog says what to install.
 
 Playing or exporting with fewer than two groups, or with every group at zero seconds, raises a warning rather than doing nothing.
 
@@ -193,9 +217,12 @@ The image travels inside the macro file as lossless base64 PNG, so a saved tacti
 |----------------|------|
 | A player | Rotate 45° · Change Colour… · Copy / Paste Style · Group · Lock/Unlock · Align Horizontally / Vertically · Copy · Cut · Delete |
 | A sign, line, label or image | Rotate 45° · Change Colour… · Copy · Cut · Delete |
-| Empty rink | Paste · Select All · Clear Ghosts · Undo · Redo · Preferences… |
+| A goal, cross, line or the boards | Delete *(named for what it is)* · Restore Rink Features · Undo |
+| Empty rink | Paste · Select All · Clear Ghosts · Restore Rink Features · Undo · Redo · Preferences… |
 
 ### Appearance
+
+The board is signed **© Simon Wagener** in its bottom-left corner. It is drawn on the canvas rather than in the surrounding chrome, so it travels with an exported frame, and it is not a selectable board item.
 
 **Colour themes** in Preferences apply to the whole board at once — attackers, defenders, lines, and signs — and repaint what is already there, not only what comes next.
 
@@ -208,7 +235,7 @@ The image travels inside the macro file as lossless base64 PNG, so a saved tacti
 | Colour-blind: Blue / Orange | `#0072b2` | `#e69f00` | Okabe–Ito, safe for all red-green types |
 | Colour-blind: Blue / Vermillion | `#0072b2` | `#d55e00` | Okabe–Ito, strong brightness separation |
 | Colour-blind: Teal / Magenta | `#009e73` | `#cc79a7` | Okabe–Ito, also blue-yellow safe |
-| Nijmegen Flames | `#e8262b` | `#4c4c4e` | Club crest red and slate, yellow marks |
+| Nijmegen Flames | `#e8262b` | `#4c4c4e` | Club colours on the players only; arrows and marks stay black |
 | Nijmegen Hot Shots | `#e8262b` | `#111111` | Club logo red on black |
 
 The colour-blind sets come from the Okabe–Ito palette, chosen because the usual red-versus-blue board is close to the pairing those readers cannot separate. Each set also differs in brightness, not only in hue, so it survives printing in grey.
@@ -223,6 +250,10 @@ Other appearance behaviour:
 
 The application uses a command-based architecture that records editing operations. Each operation can be undone (`Ctrl + Z`), redone (`Ctrl + Y`), serialized into a JSON macro, and replayed later.
 
+**A saved file is the play, not a recipe for re-enacting it.** Version 3 files carry every mark in rink metres, every player's position, and the whole timeline — each group's name, its duration, the second it starts and ends at, and the positions it ends on. Opening a file rebuilds that directly instead of replaying the command log, which is why a play reopens identically whatever the window size, field or zoom. Replaying pixel coordinates is what used to scatter the arrows and collapse every group into one.
+
+**Saving offers to tidy the recording.** The command log kept alongside the play contains things nobody ever saw: a formation replaced by another for the same team *in the same animation group*, moves of players since taken off the board, and runs of consecutive moves that are one displacement in the end. Save offers to leave those out and says how many it found. Because the log is history rather than what the file is rebuilt from, tidying cannot change the play — the check suite proves it by saving the same play both ways, reopening each, exporting both to GIF and comparing every frame.
+
 Undo takes back everything an action produced — the movement, the ghost it left, its line in the group, and the drawing it made — as one step. Undoing one action inside a group leaves the group in place and simply removes that action from it.
 
 ---
@@ -236,7 +267,7 @@ Undo takes back everything an action produced — the movement, the ghost it lef
 3. Drag players into their exact starting positions. This is group 0, the stage the animation opens on.
 4. Press **Add Group**, then make the first phase happen: move the players involved, draw the pass, stamp a mark. All of it plays together.
 5. Repeat for each phase. Rename and retime groups by double-clicking them.
-6. **Save** to JSON, or **Export** to GIF.
+6. **Save** to JSON, or **Export** to GIF, video or stills.
 
 ### Reusing a play
 
@@ -290,7 +321,7 @@ Commands are pushed with `execute=True` when the change has yet to happen, and `
 
 ### Positions in rink metres
 
-Pixel coordinates are meaningless across a redraw, because the scale, the origin, and the orientation can all change. Every saved position is therefore converted to metres on a 40 × 20 m rink (20 × 20 for the half rink) and converted back when the board is drawn.
+Pixel coordinates are meaningless across a redraw, because the scale, the origin, the orientation and the field itself can all change. Every saved position is therefore converted to metres on the current field — 40 × 20, 20 × 20, 22 × 11 or 27 × 15 m — and converted back when the board is drawn. Switching fields is exactly this conversion, which is why the players stay where they belong on the rink instead of where their pixels were.
 
 ```text
 landscape:  px = ox + mx·s          rotated:  px = ox + my·s
@@ -325,7 +356,10 @@ Sections are measured, then partitioned into rows by a dynamic-programming split
 | Drag selection box | Select multiple items |
 | `Ctrl + A` | Select all |
 | `Ctrl + C` / `Ctrl + X` / `Ctrl + V` | Copy / Cut / Paste |
-| `Delete` / `Backspace` | Delete the selection |
+| `Delete` | Delete the selection now |
+| `Backspace` | Remove a mark *in the play* — it stays on the board and goes when its group comes up |
+| `Ctrl + +` / `Ctrl + -` / `Ctrl + 0` | Zoom in / out / back to the whole rink |
+| Wheel / `Shift` + wheel | Scroll a zoomed board up-down / left-right |
 | `Ctrl + Z` | Undo |
 | `Ctrl + Y`, `Ctrl + Shift + Z` | Redo |
 | `Escape` | Cancel the active tool |
@@ -336,13 +370,19 @@ Sections are measured, then partitioned into rows by a dynamic-programming split
 
 `Delete` and `Backspace` are ignored while the focus is in a text field, so editing a roster count or a tactic percentage never removes players from the rink.
 
+**Two ways to remove a mark.** `Delete` takes it off the board there and then. `Backspace` writes the removal into the play instead: the mark stays on the rink while you work, the timeline gains a *Remove …* line in the open group, and during the animation it disappears when that group comes up. Deleting that timeline row calls the removal off. Players have no such half-state, so `Backspace` deletes them outright.
+
+**Zoom** multiplies the scale of the same rink-metre projection, so players, drawings and images all keep their place on the rink through it. `Ctrl + 0` fits the whole thing back into the canvas and re-centres it. Zoom is also in the **View** menu.
+
+**Scrolling** a zoomed board: the **wheel** moves it up and down, **Shift + wheel** moves it sideways. It stops at the edge of the rink, and while the whole rink already fits on screen there is nothing hidden, so the wheel does nothing.
+
 ---
 
 ## Preferences and Configuration
 
 **Preferences** (General → Prefs, or Menu → Preferences…) covers:
 
-- **Board** — half rink, curved arches, show goals, snap players, snap angles, snap to grid, ghosting.
+- **Board** — the field (5v5 / 4v4 / 3v3), the half rink, show goals, snap players, snap angles, snap to grid, ghosting.
 - **Menu** — toolbar position (top/bottom) and rows (auto/one/two).
 - **Colours** — the theme picker, plus individual pickers for attackers, defenders, lines, and signs.
 
@@ -363,6 +403,7 @@ Settings are written to `~/.floorball_tactics_config.json` as they change:
   "att_pct": "70",
   "def_pct": "60",
   "half_rink": false,
+  "rink_mode": "5v5",
   "grid": false,
   "snap_player": true,
   "snap_angle": false,
@@ -386,7 +427,8 @@ Only the theme's *name* is stored; the individual colours are saved alongside it
 .
 ├── floorball_studio/
 │   ├── floorball_animator.py   # The whole application
-│   └── selfcheck.py            # Automated checks
+│   ├── selfcheck.py            # Automated checks
+│   └── to_do_list.md           # Roadmap
 ├── start.sh
 ├── README.md
 └── LICENSE.txt
@@ -403,7 +445,8 @@ The application is deliberately a single module. Everything shares one canvas an
 - Python 3.8 or newer
 - Tkinter (included with most Python distributions; on Debian/Ubuntu, `sudo apt install python3-tk`)
 - Pillow
-- Ghostscript — only for GIF export, which captures the canvas through PostScript (`sudo apt install ghostscript`)
+- Ghostscript — for every export, which captures the canvas through PostScript (`sudo apt install ghostscript`)
+- imageio or OpenCV — only for video export (`pip install imageio imageio-ffmpeg`, or `pip install opencv-python`)
 
 Install the Python dependency:
 
@@ -432,103 +475,113 @@ python3 floorball_studio/selfcheck.py
 ```
 
 ```text
-496/496 checks passed
+751/751 checks passed
 
-Function coverage: 200/200 (100%) of the app's functions ran
+Function coverage: 263/263 (100%) of the app's functions ran
 ```
 
 The checks are grouped into areas:
 
 | Area | Covers |
 |------|--------|
-| A. Geometry | Metre↔pixel round trips in all four rink modes |
+| A. Geometry | Metre↔pixel round trips on every field, in both orientations |
 | B. Players | Every shape: item tracking, rotation round-trips, complete deletion |
-| C. Selection | Select all, group, lock, align, distribute, ghosts, the Delete key |
+| C. Selection | Select all, group, lock, align, distribute, ghosts, the Delete key, undoing a player deletion |
 | D. Snapping | Grid, 45° angles, ball-to-edge, identical snapping across shapes, attachment on Shift |
-| E. Shapes and drawings | Every sign and tool, bend editing, text, images, size and colour, outline-only shapes |
+| E. Shapes and drawings | Every sign and tool, bend editing and weight, corner resizing of every mark, whole-mark selection, text, images, size and colour, outline-only shapes |
 | F. Tactics | Every formation: roster resize, roles, timeline entry, board bounds |
 | G. Undo and redo | Each command class round-trips; empty stacks are safe |
-| H. Macros | Board snapshots survive loading into a different window size |
+| H. Play files | The whole play out and back into a different window size: marks in metres, groups, times, attachments, pictures; tidying the record and proving both files export identical GIFs |
 | I. Watermark | Histogram detection, keying, crop, opacity, layering, round trip |
 | J. Toolbar | Two rows at every width, nothing squeezed below its size |
 | K. Player resizing | All players, zero drift, no leftovers, labels preserved |
 | L. Config and UI | Config round trip, roster in place, tooltip coverage, context menus |
 | M. Mouse | Real press/drag/release: move, box-select, cut/paste, draw, stamp |
 | N. Dialogs | Colour pickers, save/load, watermark, preferences and its Cancel — all stubbed |
-| O. Animation | Groups, times, simultaneity, playback, reordering, GIF export, warnings |
+| O. Animation | Groups, times, simultaneity, playback, attached arrows tracking their player, Backspace removals, reordering, export to every format, warnings |
+| P. Rink fixtures | Selecting and deleting goals, crosses, lines and boards; survival across redraws |
+| Q. Rink sizes | All three fields and their halves measured in metres: sizes, goal lines, areas, spots, substitution zones, team sizes, the field and half buttons, zoom |
 
 It redirects the configuration file and stubs every dialog, so a run has no side effects outside a temporary directory. It exits non-zero if anything fails, and reports which functions were never entered.
 
 ---
 
-## Macro File Format
+## Play File Format
 
-Recorded tactical sequences are stored as JSON. Version 2 files pair the command log with a snapshot of where everything actually stands, in rink metres.
+A saved play is JSON. **Version 3 is the play itself, not a recipe for re-enacting it**: where every mark sits in rink metres, every player's position, and the whole timeline with each group's duration and the second it starts at. Nothing is replayed when a file is opened, which is what makes a reopened play identical to the one that was saved — same arrows, same groups, same times — whatever the window size, field or zoom.
 
 ```json
 {
-    "version": 2,
-    "commands": [
-        {
-            "type": "move_tokens",
-            "moves": { "A1": [45.0, -30.0] }
-        },
-        {
-            "type": "tactic",
-            "team": "att",
-            "formation": "House",
-            "percent": 70,
-            "moves": { "A1": [12.0, -8.0] },
-            "positions": { "A1": "LD" }
-        },
-        {
-            "type": "draw",
-            "tool": "pass",
-            "x1": 240.0, "y1": 120.0,
-            "x2": 330.0, "y2": 135.0,
-            "extra": {}
-        },
-        {
-            "type": "rotate_tokens",
-            "labels": ["A1"],
-            "degrees": 45
-        },
-        {
-            "type": "group",
-            "labels": ["A1", "A2"],
-            "is_ungroup": false
-        },
-        {
-            "type": "lock",
-            "labels": ["D1"],
-            "lock_state": true
-        },
-        {
-            "type": "watermark",
-            "watermark": {
-                "mx": 20.0, "my": 10.0, "w_m": 12.0, "h_m": 6.0,
-                "crop": null,
-                "bg_tolerance": 12, "bg_mode": "light",
-                "behind": true, "opacity": 100,
-                "path": "club_logo.png",
-                "image_format": "PNG",
-                "png_base64": "iVBORw0KGgo..."
-            }
-        }
-    ],
+    "version": 3,
+    "app": "Floorball Tactics Studio",
+    "saved_at": "2026-08-13T11:20:41",
+
     "board": {
+        "rink_mode": "5v5",
         "half_rink": false,
         "rink_rotated": false,
+        "hidden_pitch_parts": [],
         "players": [
             { "label": "A1", "team": "att", "position": "LD",
               "shape": "Square", "color": "#000000", "mx": 12.5, "my": 6.0 }
         ],
         "watermark": null
-    }
+    },
+
+    "drawings": [
+        {
+            "kind": "line",
+            "points_m": [[12.5, 6.0], [18.2, 9.4]],
+            "style": { "fill": "#000000", "width": "4.0", "dash": "4 4",
+                       "arrow": "last", "arrowshape": "14 18 7" },
+            "meta": { "type": "tactic_line", "tool": "pass",
+                      "color": "#000000", "color_options": ["fill"],
+                      "anim_group": 1, "anim_action": "Pass" },
+            "data": { "tool": "pass", "x1_m": 12.5, "y1_m": 6.0,
+                      "x2_m": 18.2, "y2_m": 9.4, "extra": {} }
+        },
+        {
+            "kind": "image",
+            "points_m": [[20.0, 10.0]],
+            "style": { "anchor": "center" },
+            "meta": { "type": "image", "sign_type": "image" },
+            "image": { "png_base64": "iVBORw0KGgo...", "w_m": 4.0, "h_m": 2.0 }
+        }
+    ],
+
+    "attachments": { "A1": { "start": [0], "end": [] } },
+
+    "animation": {
+        "fps": 25,
+        "playhead": 0,
+        "total_seconds": 2.0,
+        "groups": [
+            { "index": 0, "name": "Group 0", "starts_at": 0.0,
+              "duration": 2.0, "ends_at": 0.0, "actions": ["Pass"],
+              "board": { "players": [ { "label": "A1", "mx": 12.5, "my": 6.0 } ] } },
+            { "index": 1, "name": "Move A1", "starts_at": 0.0,
+              "duration": 0.8, "ends_at": 0.8, "actions": ["Move A1"],
+              "board": { "players": [ { "label": "A1", "mx": 16.7, "my": 8.1 } ] } }
+        ]
+    },
+
+    "commands": [ { "type": "move_tokens", "moves": { "A1": [45.0, -30.0] } } ]
 }
 ```
 
-### Command types in a macro
+| Section | What it holds |
+|---------|---------------|
+| `board` | The field, its orientation, which fixtures were removed, every player in rink metres, and the watermark |
+| `drawings` | Every mark: its canvas kind, its points **in rink metres**, the exact style it is drawn with, which animation group it belongs to, and — for a picture — the image itself as base64 PNG |
+| `attachments` | Which arrows are snapped to which player, by position in `drawings` |
+| `animation` | Every group: name, duration, `starts_at` / `ends_at` on the play's clock, the actions in it, and the positions it ends on |
+| `commands` | The command log — the history of how the play was built. Kept for reading and for `Ctrl + Z` style replay, but **nothing about reopening a file depends on it** |
+
+Because the file is the play rather than a recipe, the **Tidy the recording** option at save time cannot change what comes back: it shortens `commands` only. The check suite proves this by saving the same play tidied and untidied, reopening both, exporting each to GIF, and comparing every frame.
+
+Version 1 files (a bare list of commands) and version 2 files (commands plus a board snapshot) still load; they are replayed as before.
+
+### Command types in the log
 
 | `type` | Fields |
 |--------|--------|
@@ -552,7 +605,7 @@ Version 1 files — a bare list of commands, with no board snapshot — still lo
 **The GIF export says the board could not be captured.**
 Ghostscript is missing. Tk cannot hand over a bitmap of a canvas directly, so export goes through PostScript, which Pillow renders with `gs`.
 
-**The exported GIF has no watermark or placed images.**
+**The exported GIF or video has no watermark or placed images.**
 Tk's canvas-to-PostScript export covers shapes and text only, not image items. The dialog says so when the export finishes.
 
 **Playing the animation shows the setup moves.**
@@ -572,7 +625,8 @@ That is deliberate. The minimum is 1400 × 700, below which the toolbar cannot h
 ## Known Limitations
 
 - Animation groups are **not** saved into macro files. A saved tactic reopens with its board, drawings and watermark, but the sequence has to be rebuilt.
-- GIF export does not include the watermark or placed images (see Troubleshooting).
+- Exports do not include the watermark or placed images (see Troubleshooting).
+- Video export needs imageio or OpenCV installed; GIF and still export do not.
 - Moving an action into another group moves its row and its drawing, but not the board positions: a group's snapshot is the end state of everything in it, so a move's effect on player positions stays with the group it was recorded in.
 - The toolbar cannot dock to the left or right; only top and bottom.
 
