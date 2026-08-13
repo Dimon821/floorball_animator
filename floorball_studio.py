@@ -31,23 +31,30 @@ class MoveTokensCommand(Command):
     nothing had happened. Carrying them here makes one undo take back the whole
     gesture, and redo put it back."""
 
-    def __init__(self, app, label_moves, ghosts=None, record_step=True):
+    def __init__(self, app, label_moves, ghosts=None, record_step=True,
+                 keep_attached=True):
         self.app = app
         self.label_moves = label_moves
         self.ghosts = list(ghosts or [])
+        # Whether lines snapped to these players travel with them. A hand drag decides
+        # this with Shift; a replayed macro or a formation keeps the old behaviour.
+        self.keep_attached = keep_attached
         # Composed commands (a tactic, for instance) log themselves and would otherwise
         # write a second, duplicate line.
         self.record_step = record_step
         self.step_desc = self._describe()
-        self.animation_steps = []
+        self.animation_record = None
 
     def _describe(self):
-        labels = sorted(self.label_moves)
+        # The rink shows tactical roles (LD, RW, T) once a formation is applied, while
+        # the internal labels stay A1..A5 / D1..D5. The timeline should read the way
+        # the board does, so it uses whatever the token actually displays.
+        labels = sorted(self.label_moves, key=self.app._display_label)
         if not labels:
             return "Move"
-        shown = ", ".join(labels[:3]) + (f" +{len(labels) - 3}" if len(labels) > 3 else "")
-        dx, dy = next(iter(self.label_moves.values()))
-        return f"Move {shown} ({int(dx):+d},{int(dy):+d})"
+        shown = [self.app._display_label(label) for label in labels]
+        text = ", ".join(shown[:3]) + (f" +{len(shown) - 3}" if len(shown) > 3 else "")
+        return f"Move {text}"
 
     def record(self):
         """Called once when the move is pushed: put it in the timeline and make it a
@@ -59,7 +66,7 @@ class MoveTokensCommand(Command):
             self.app.steps_listbox.insert(tk.END, self.step_desc)
         except Exception:
             pass
-        self.animation_steps = self.app._record_move_as_animation_step(
+        self.animation_record = self.app._record_move_as_animation_step(
             self.label_moves, name=self.step_desc)
 
     def _forget(self):
@@ -70,13 +77,7 @@ class MoveTokensCommand(Command):
                 self.app.steps_listbox.delete(index)
             except Exception:
                 pass
-        for step in self.animation_steps:
-            if step in self.app.animation_steps:
-                self.app.animation_steps.remove(step)
-        if self.animation_steps:
-            self.app._renumber_animation_steps()
-            self.app.animation_playhead = max(0, len(self.app.animation_steps) - 1)
-            self.app._refresh_animation_list()
+        self.app._unrecord_animation_step(self.animation_record)
 
     def _remember(self):
         if not self.record_step:
@@ -86,12 +87,7 @@ class MoveTokensCommand(Command):
             self.app.steps_listbox.insert(tk.END, self.step_desc)
         except Exception:
             pass
-        for step in self.animation_steps:
-            if step not in self.app.animation_steps:
-                self.app.animation_steps.append(step)
-        if self.animation_steps:
-            self.app._renumber_animation_steps()
-            self.app._refresh_animation_list()
+        self.app._rerecord_animation_step(self.animation_record)
 
     def execute(self):
         for label, (dx, dy) in self.label_moves.items():
@@ -132,6 +128,8 @@ class MoveTokensCommand(Command):
             if "text_ids" in token:
                 for tid in token["text_ids"]:
                     self.app.canvas.move(tid, dx, dy)
+            if not self.keep_attached:
+                return
             for line_id in token.get("attached_lines_start", []):
                 coords = self.app.canvas.coords(line_id)
                 if coords and len(coords) >= 4:
@@ -165,7 +163,7 @@ class ApplyTacticCommand(Command):
         self.label_moves = label_moves          # internal label -> (dx, dy)
         self.positions = positions              # internal label -> role, e.g. "LD"
         self.previous_positions = {}
-        self.animation_steps = []
+        self.animation_record = None
         # Composed rather than subclassed so the movement keeps following attached
         # tactic lines exactly as a hand-drag would.
         # record_step=False: this command writes its own, richer timeline line and
@@ -193,17 +191,13 @@ class ApplyTacticCommand(Command):
         except Exception:
             pass
         # On redo, put the keyframe back where it was.
-        for step in self.animation_steps:
-            if step not in self.app.animation_steps:
-                self.app.animation_steps.append(step)
-        if self.animation_steps:
-            self.app._renumber_animation_steps()
-            self.app._refresh_animation_list()
+        self.app._rerecord_animation_step(self.animation_record)
 
     def record(self):
-        """A formation change is a move of the whole team, so it becomes a keyframe
-        like any other -- the timeline line itself is written in execute()."""
-        self.animation_steps = self.app._record_move_as_animation_step(
+        """A formation change is a move of the whole team, so it joins the step being
+        built like any other action -- the timeline line itself is written in
+        execute()."""
+        self.animation_record = self.app._record_move_as_animation_step(
             self.label_moves, name=self.step_desc)
 
     def undo(self):
@@ -217,13 +211,7 @@ class ApplyTacticCommand(Command):
                 self.app.steps_listbox.delete(index)
             except Exception:
                 pass
-        for step in self.animation_steps:
-            if step in self.app.animation_steps:
-                self.app.animation_steps.remove(step)
-        if self.animation_steps:
-            self.app._renumber_animation_steps()
-            self.app.animation_playhead = max(0, len(self.app.animation_steps) - 1)
-            self.app._refresh_animation_list()
+        self.app._unrecord_animation_step(self.animation_record)
 
     def serialize(self):
         return {
@@ -444,7 +432,8 @@ class DrawLineCommand(Command):
         self.x1, self.y1, self.x2, self.y2 = x1, y1, x2, y2
         self.extra_data = extra_data or {}
         self.line_ids = []
-        self.step_desc = f"{tool.capitalize()} ({int(x1)},{int(y1)} ➔ {int(x2)},{int(y2)})"
+        self.animation_record = None
+        self.step_desc = tool.capitalize()
         self.drawing_data = {"tool": self.tool, "x1": self.x1, "y1": self.y1, "x2": self.x2, "y2": self.y2, "extra": self.extra_data}
 
     def execute(self):
@@ -458,6 +447,13 @@ class DrawLineCommand(Command):
             self.app.steps_listbox.insert(tk.END, self.step_desc)
         except Exception:
             pass
+        # On redo, put the group entry back too.
+        self.app._rerecord_animation_step(self.animation_record)
+
+    def record(self):
+        """An arrow belongs to the group it was drawn in, alongside the moves."""
+        self.animation_record = self.app.record_action_in_group(self.step_desc)
+        self.app.tag_items_with_group(self.line_ids, self.step_desc)
 
     def undo(self):
         for pid in list(self.line_ids):
@@ -477,6 +473,7 @@ class DrawLineCommand(Command):
                 self.app.steps_listbox.delete(idx)
             except Exception:
                 pass
+        self.app._unrecord_animation_step(self.animation_record)
 
     def serialize(self):
         return {"type": "draw", "tool": self.tool, "x1": self.x1, "y1": self.y1, "x2": self.x2, "y2": self.y2, "extra": self.extra_data}
@@ -931,21 +928,81 @@ class FloorballTacticsApp:
         color_code = colorchooser.askcolor(title="Choose Attack Team Color", color=self.att_color)[1]
         if color_code:
             self.att_color = color_code
-            try:
-                self.btn_att_color.config(bg=self.att_color)
-            except Exception:
-                pass
-            self._update_roster()
+            self.recolor_team("att", color_code)
 
     def choose_def_color(self):
         color_code = colorchooser.askcolor(title="Choose Defense Team Color", color=self.def_color)[1]
         if color_code:
             self.def_color = color_code
+            self.recolor_team("def", color_code)
+
+    def recolor_team(self, team, colour):
+        """Repaint a team where it stands.
+
+        This used to call _update_roster(), which deletes every token and respawns the
+        default formation -- so picking a colour threw away the arrangement, the roles
+        and the undo history along with it."""
+        swatch = getattr(self, "btn_att_color" if team == "att" else "btn_def_color", None)
+        if swatch is not None:
             try:
-                self.btn_def_color.config(bg=self.def_color)
+                swatch.config(bg=colour)
             except Exception:
                 pass
-            self._update_roster()
+        for token in self._team_tokens(team):
+            token["color"] = colour
+            skip = set(token.get("decor_ids", ())) | set(token.get("halo_ids", ()))
+            for item in self._token_items(token):
+                if item in skip:
+                    continue
+                try:
+                    self.canvas.itemconfig(item, fill=colour)
+                except Exception:
+                    pass
+        self._save_config()
+
+    def _roster_count_changed(self, event=None):
+        """Adding or removing players resizes the team in place, leaving the players
+        already on the board exactly where they are."""
+        for team, spinbox in (("att", getattr(self, "att_spinbox", None)),
+                              ("def", getattr(self, "def_spinbox", None))):
+            if spinbox is None:
+                continue
+            try:
+                wanted = max(1, min(10, int(spinbox.get())))
+            except Exception:
+                continue
+            if wanted != len(self._team_tokens(team)):
+                self._set_team_count(team, wanted)
+
+    def _roster_shape_changed(self, event=None):
+        """Restyle a team without moving it: each player is redrawn in the new shape at
+        the spot it already occupies."""
+        for team, shape_var in (("att", getattr(self, "att_shape_var", None)),
+                                ("def", getattr(self, "def_shape_var", None))):
+            if shape_var is None:
+                continue
+            shape = shape_var.get()
+            for token in self._team_tokens(team):
+                if str(token.get("shape", "")).lower() == shape.lower():
+                    continue
+                box = self.canvas.bbox(token["shape_id"])
+                if not box:
+                    continue
+                cx, cy = (box[0] + box[2]) / 2, (box[1] + box[3]) / 2
+                carried = {key: token.get(key) for key in
+                           ("label", "team", "position", "color", "size", "locked",
+                            "angle", "is_ghost", "ghost_of", "stipple")}
+                self._delete_token(token)
+                sid = self._create_token(cx, cy, carried["label"], shape=shape,
+                                         color=carried["color"] or "black",
+                                         size=carried["size"], team=carried["team"])
+                fresh = self.tokens.get(sid)
+                if fresh:
+                    fresh.update({k: v for k, v in carried.items()
+                                  if k not in ("label", "shape")})
+                    fresh["shape"] = shape
+                    self._set_token_position(fresh, carried["position"])
+        self.highlight_selected()
 
     # ----------------------
     # Macros save / load
@@ -1193,7 +1250,9 @@ class FloorballTacticsApp:
         if not text:
             return []
         try:
-            size = int(size if size is not None else self.text_size_var.get())
+            # One Size dial for the whole box: a new label is typed at the size shown
+            # there, the same size a stamped sign would use.
+            size = int(size if size is not None else self.sign_size_var.get())
         except Exception:
             size = 14
         size = max(self.TEXT_MIN_SIZE, min(self.TEXT_MAX_SIZE, size))
@@ -1203,6 +1262,9 @@ class FloorballTacticsApp:
         self._register_drawn_item(cid, {"type": "text", "sign_type": "text",
                                         "text": text, "size": size,
                                         "color": self.sign_color})
+        description = f'Text "{text}"'
+        self.record_action_in_group(description)
+        self.tag_items_with_group([cid], description)
         return [cid]
 
     def _scale_board_text(self, cid, factor):
@@ -1264,8 +1326,12 @@ class FloorballTacticsApp:
                 self.canvas.delete(member)
                 self.drawn_items.pop(member, None)
                 removed.add(member)
-            added.update(self.place_sign_canvas(centre[0], centre[1], sign_type,
-                                                size=size))
+            self._replaying_sign = True
+            try:
+                added.update(self.place_sign_canvas(centre[0], centre[1], sign_type,
+                                                    size=size))
+            finally:
+                self._replaying_sign = False
 
         if removed or added:
             # Keep everything else that was selected: restamping the signs must not
@@ -1315,6 +1381,9 @@ class FloorballTacticsApp:
         cx, cy = self._pitch_center_px()
         record = {"original": image, "path": path, "w_px": width_px, "h_px": height_px}
         cid = self._draw_board_image(record, cx, cy)
+        description = f"Image {os.path.basename(path)}"
+        self.record_action_in_group(description)
+        self.tag_items_with_group([cid], description)
         self.clear_selection()
         self.selected_drawn = {cid}
         self.highlight_selected()
@@ -1422,31 +1491,48 @@ class FloorballTacticsApp:
 
         The very first Add Step records two: the board as it stands becomes step 0, the
         opening slide, so there is always something to move *from*."""
-        duration = max(0.1, float(self.step_time_var.get()))
+        duration = max(0.0, float(self.step_time_var.get()))
         snapshot = self._board_snapshot()
         if not self.animation_steps:
             self.animation_steps.append({"duration": duration, "board": snapshot,
-                                         "name": "Start"})
+                                         "name": "Start", "actions": [],
+                                         "named": False, "closed": True})
             self.animation_playhead = 0
             self._refresh_animation_list()
             return
+        # Closing the current group is the point of the button: whatever is recorded
+        # next starts a new step instead of joining this one.
+        if self.animation_steps:
+            self.animation_steps[-1]["closed"] = True
         self.animation_steps.append({"duration": duration, "board": snapshot,
-                                     "name": f"Step {len(self.animation_steps)}"})
+                                     "name": f"Step {len(self.animation_steps)}",
+                                     "actions": [], "named": False})
         self.animation_playhead = len(self.animation_steps) - 1
         self._refresh_animation_list()
 
     def delete_animation_step(self):
         if not self.animation_steps:
-            messagebox.showwarning("No steps", "There are no animation steps to delete.")
+            messagebox.showwarning("No groups", "There are no groups to delete.")
             return
         index = self.animation_playhead
         if 0 <= index < len(self.animation_steps):
             self.animation_steps.pop(index)
-        for position, step in enumerate(self.animation_steps):
-            step["name"] = "Start" if position == 0 else f"Step {position}"
+        # _renumber_animation_steps, not a blanket rename: a step called after the
+        # action that made it ("Move LD, RW") must keep saying so. Renaming every
+        # survivor to "Step n" made deleting one look like it had wiped the others.
+        self._renumber_animation_steps()
         self.animation_playhead = max(0, min(self.animation_playhead,
                                              len(self.animation_steps) - 1))
         self._refresh_animation_list()
+
+    def _display_label(self, label):
+        """What the rink shows for this player: its tactical role once a formation has
+        been applied, otherwise its internal label."""
+        sid = self._get_sid_by_label(label)
+        token = self.tokens.get(sid) if sid else None
+        if token:
+            return token.get("position") or token.get("label") or str(label)
+        return str(label)
 
     def _px_delta_to_m(self, dx, dy):
         """A pixel offset expressed in rink metres, honouring the rink's orientation."""
@@ -1457,54 +1543,180 @@ class FloorballTacticsApp:
         return (dx / scale, dy / scale)
 
     def _record_move_as_animation_step(self, label_moves, name=None):
-        """Turn a completed move into a keyframe, so dragging players around builds the
-        animation as you go.
+        """Fold a completed move into the step being built.
+
+        A step is a group of actions that happen *together*: everything recorded into
+        one step plays simultaneously when the animation runs. Moves therefore
+        accumulate into the current step rather than each starting a new one -- press
+        **Add Step** to close the group and begin the next.
 
         When this is the first one, the board *before* the move is recorded as step 0 --
         the opening slide -- by winding the moved players back along their own deltas.
         Without it the sequence would begin at the end of the first move, with nothing
         to travel from."""
         if not label_moves:
-            return []
-        added = []
+            return None
         after = self._board_snapshot()
+        record = {"created": [], "merged": None}
+
         if not self.animation_steps:
-            before = json.loads(json.dumps(after))
-            for player in before.get("players", []):
-                delta = label_moves.get(player.get("label"))
-                if not delta:
-                    continue
-                dmx, dmy = self._px_delta_to_m(delta[0], delta[1])
-                player["mx"] = round(player["mx"] - dmx, 3)
-                player["my"] = round(player["my"] - dmy, 3)
+            # Group 0 is the board as it stands, not as it stood before this move.
+            # Arranging the players is setup, not choreography: the animation begins
+            # at the arrangement rather than playing back how it was reached.
             start = {"duration": max(0.1, float(self.step_time_var.get())),
-                     "board": before, "name": "Start"}
+                     "board": after, "name": "Group 0",
+                     "actions": [name] if name else [],
+                     "named": False, "closed": False}
             self.animation_steps.append(start)
-            added.append(start)
-        step = {"duration": max(0.1, float(self.step_time_var.get())),
-                "board": after,
-                "name": name or f"Step {len(self.animation_steps)}",
-                "named": bool(name)}
-        self.animation_steps.append(step)
-        added.append(step)
+            record["created"].append(start)
+            self._renumber_animation_steps()
+            self.animation_playhead = 0
+            self._refresh_animation_list()
+            return record
+
+        current = self.animation_steps[-1]
+        if current is None or current.get("closed"):
+            step = {"duration": max(0.1, float(self.step_time_var.get())),
+                    "board": after, "actions": [], "named": False,
+                    "name": f"Step {len(self.animation_steps)}"}
+            self.animation_steps.append(step)
+            record["created"].append(step)
+            current = step
+        else:
+            # Everything in this step moves at once, so the step holds where the board
+            # ends up once all of its actions have been applied.
+            record["merged"] = {"step": current, "before": self._step_state(current)}
+            current["board"] = after
+
+        if name:
+            current.setdefault("actions", []).append(name)
+            # Group 0 is the stage the animation begins at, so arranging the board
+            # there is setup rather than choreography: it keeps its plain name, while
+            # still listing what was done inside it.
+            is_opening = self.animation_steps.index(current) == 0
+            if not current.get("custom_name") and not is_opening:
+                current["name"] = self._step_name_from_actions(current["actions"])
+                current["named"] = True
+        if record["merged"]:
+            record["merged"]["after"] = self._step_state(current)
+
         self._renumber_animation_steps()
         self.animation_playhead = len(self.animation_steps) - 1
         self._refresh_animation_list()
-        return added
+        return record
+
+    @staticmethod
+    def _step_state(step):
+        return {"board": step.get("board"),
+                "actions": list(step.get("actions") or []),
+                "name": step.get("name"),
+                "named": step.get("named", False)}
+
+    @staticmethod
+    def _step_name_from_actions(actions):
+        """One row for a group of simultaneous actions."""
+        if not actions:
+            return ""
+        if len(actions) == 1:
+            return actions[0]
+        moves = [a[5:] for a in actions if a.startswith("Move ")]
+        others = [a for a in actions if not a.startswith("Move ")]
+        parts = []
+        if moves:
+            parts.append("Move " + ", ".join(moves))
+        parts.extend(others)
+        return " + ".join(parts)
+
+    def _unrecord_animation_step(self, record):
+        """Take back exactly what `_record_move_as_animation_step` did."""
+        if not record:
+            return
+        merged = record.get("merged")
+        if merged:
+            merged["step"].update(merged["before"])
+        for step in record.get("created", []):
+            if step in self.animation_steps:
+                self.animation_steps.remove(step)
+        self._renumber_animation_steps()
+        self.animation_playhead = max(0, len(self.animation_steps) - 1)
+        self._refresh_animation_list()
+
+    def _rerecord_animation_step(self, record):
+        """Redo: put the group back the way the action left it."""
+        if not record:
+            return
+        for step in record.get("created", []):
+            if step not in self.animation_steps:
+                self.animation_steps.append(step)
+        merged = record.get("merged")
+        if merged and merged.get("after"):
+            merged["step"].update(merged["after"])
+        self._renumber_animation_steps()
+        self.animation_playhead = max(0, len(self.animation_steps) - 1)
+        self._refresh_animation_list()
+
+    def tag_items_with_group(self, ids, description=None):
+        """Remember which group a drawing belongs to, so playback can bring it in with
+        that group instead of having it sit on the rink from the first frame."""
+        index = max(0, len(self.animation_steps) - 1)
+        for cid in ids or ():
+            meta = self.drawn_items.get(cid)
+            if meta is None:
+                continue
+            meta["anim_group"] = index
+            meta["anim_action"] = description
+            coords = self.canvas.coords(cid)
+            if coords:
+                meta["full_coords"] = list(coords)
+
+    def record_action_in_group(self, description):
+        """Put a non-movement action -- an arrow, a sign, a label -- into the group
+        being built, so the timeline shows everything that makes up a group and not
+        only the players that moved."""
+        if not description:
+            return None
+        record = {"created": [], "merged": None}
+        if not self.animation_steps:
+            group = {"duration": max(0.0, float(self.step_time_var.get())),
+                     "board": self._board_snapshot(), "name": "Group 0",
+                     "actions": [description], "named": False, "closed": False}
+            self.animation_steps.append(group)
+            record["created"].append(group)
+        else:
+            current = self.animation_steps[-1]
+            if current.get("closed"):
+                current = {"duration": max(0.0, float(self.step_time_var.get())),
+                           "board": self._board_snapshot(),
+                           "name": f"Group {len(self.animation_steps)}",
+                           "actions": [], "named": False, "closed": False}
+                self.animation_steps.append(current)
+                record["created"].append(current)
+            else:
+                record["merged"] = {"step": current, "before": self._step_state(current)}
+            current.setdefault("actions", []).append(description)
+            if not current.get("custom_name") and self.animation_steps.index(current) > 0:
+                current["name"] = self._step_name_from_actions(current["actions"])
+                current["named"] = True
+            if record["merged"]:
+                record["merged"]["after"] = self._step_state(current)
+        self._renumber_animation_steps()
+        self.animation_playhead = len(self.animation_steps) - 1
+        self._refresh_animation_list()
+        return record
 
     def _renumber_animation_steps(self):
         """Keep the automatic names in step with the order. A step named after the
         action that made it ("Move A1", "Attack House 70% ...") keeps that name --
         renumbering must not throw away what the row actually says."""
         for position, step in enumerate(self.animation_steps):
-            if step.get("named"):
+            if step.get("named") or step.get("custom_name"):
                 continue
-            step["name"] = "Start" if position == 0 else f"Step {position}"
+            step["name"] = f"Group {position}"
 
     def move_animation_step(self, delta):
         """Move the selected step one place up or down the sequence."""
         if not self.animation_steps:
-            messagebox.showwarning("No steps", "There are no animation steps to move.")
+            messagebox.showwarning("No groups", "There are no groups to move.")
             return
         index = self.animation_playhead
         target = index + delta
@@ -1521,16 +1733,31 @@ class FloorballTacticsApp:
         self._refresh_animation_list()
 
     def _anim_drag_start(self, event):
-        self._anim_drag_index = self.anim_listbox.nearest(event.y)
+        """A group row is dragged to reorder the sequence; one of the action rows
+        inside a group is dragged to move that action into another group."""
+        item = self.anim_tree.identify_row(event.y)
+        self._anim_drag_index = self._group_index_for(item)
+        self._anim_drag_action = None
+        if item and "a" in item[1:]:
+            group_text, _, position = item[1:].partition("a")
+            try:
+                self._anim_drag_action = (int(group_text), int(position))
+            except ValueError:
+                self._anim_drag_action = None
         return None
 
     def _anim_drag_motion(self, event):
-        """Show where the dragged step would land by moving it as the pointer goes."""
+        """Reordering happens live for groups. An action is only re-homed on release,
+        so it can be carried across the list without every row it passes claiming it."""
+        if getattr(self, "_anim_drag_action", None) is not None:
+            return None
         source = getattr(self, "_anim_drag_index", None)
         if source is None or not self.animation_steps:
             return None
-        target = max(0, min(self.anim_listbox.nearest(event.y),
-                            len(self.animation_steps) - 1))
+        under = self._group_index_for(self.anim_tree.identify_row(event.y))
+        if under is None:
+            return None
+        target = max(0, min(under, len(self.animation_steps) - 1))
         if target == source:
             return None
         step = self.animation_steps.pop(source)
@@ -1541,36 +1768,170 @@ class FloorballTacticsApp:
         self._refresh_animation_list()
         return None
 
-    def _anim_drag_end(self, _event=None):
-        if getattr(self, "_anim_drag_index", None) is not None:
+    def _anim_drag_end(self, event=None):
+        dragged_action = getattr(self, "_anim_drag_action", None)
+        if dragged_action is not None and event is not None:
+            target = self._group_index_for(self.anim_tree.identify_row(event.y))
+            self.move_action_to_group(dragged_action[0], dragged_action[1], target)
+        elif getattr(self, "_anim_drag_index", None) is not None:
             self.stop_animation(rewind=False)
             self._refresh_animation_list()
         self._anim_drag_index = None
+        self._anim_drag_action = None
         return None
 
+    def move_action_to_group(self, source_index, position, target_index):
+        """Move one action out of its group and into the group it was dropped on."""
+        if target_index is None or source_index == target_index:
+            return False
+        if not (0 <= source_index < len(self.animation_steps)):
+            return False
+        if not (0 <= target_index < len(self.animation_steps)):
+            return False
+        source = self.animation_steps[source_index]
+        actions = source.get("actions") or []
+        if not (0 <= position < len(actions)):
+            return False
+        action = actions.pop(position)
+        target = self.animation_steps[target_index]
+        target.setdefault("actions", []).append(action)
+        # Both ends get their heading rebuilt, unless they carry a name of their own --
+        # dropping an action used to leave the group called after it.
+        for index, group in ((source_index, source), (target_index, target)):
+            if group.get("custom_name"):
+                continue
+            if index == 0 or not group.get("actions"):
+                group["name"] = f"Group {index}"
+                group["named"] = False
+            else:
+                group["name"] = self._step_name_from_actions(group["actions"])
+                group["named"] = True
+        # Whatever the action drew moves with it, so it appears in its new group.
+        for meta in self.drawn_items.values():
+            if meta.get("anim_action") == action and meta.get("anim_group") == source_index:
+                meta["anim_group"] = target_index
+        self.animation_playhead = target_index
+        self._renumber_animation_steps()
+        self._refresh_animation_list()
+        return True
+
     def _refresh_animation_list(self):
-        listbox = getattr(self, "anim_listbox", None)
-        if listbox is None:
+        tree = getattr(self, "anim_tree", None)
+        if tree is None:
             return
-        listbox.delete(0, tk.END)
-        for index, step in enumerate(self.animation_steps):
-            listbox.insert(tk.END, f"{index}  {step['name']}   {step['duration']:.1f}s")
-        # The playhead is the red row: playback starts there.
-        if 0 <= self.animation_playhead < len(self.animation_steps):
-            listbox.itemconfig(self.animation_playhead,
-                               background=self.PLAYHEAD_COLOR, foreground="#ffffff",
-                               selectbackground=self.PLAYHEAD_COLOR)
+        # Remember which groups were folded, so a redraw does not spring them open.
+        collapsed = {index for index, item in enumerate(tree.get_children(""))
+                     if not tree.item(item, "open")}
+        tree.delete(*tree.get_children(""))
+        for index, group in enumerate(self.animation_steps):
+            tags = ["group"]
+            if index == self.animation_playhead:
+                tags.append("playhead")     # the red row: playback starts here
+            node = tree.insert("", tk.END, iid=f"g{index}",
+                               text=f"{index}  {group['name']}",
+                               values=(f"{group['duration']:.1f}s",),
+                               open=index not in collapsed, tags=tuple(tags))
+            for position, action in enumerate(group.get("actions") or []):
+                tree.insert(node, tk.END, iid=f"g{index}a{position}",
+                            text=f"   {action}", values=("",), tags=("action",))
+
+    def _group_index_for(self, item):
+        """The group a tree row belongs to -- the row itself, or its parent when the
+        row is one of the actions inside a group."""
+        if not item:
+            return None
+        if not item.startswith("g"):
+            return None
+        parent = self.anim_tree.parent(item)
+        target = parent or item
+        try:
+            return int(target[1:].split("a")[0])
+        except ValueError:
+            return None
 
     def _on_anim_step_selected(self, _event=None):
-        selection = self.anim_listbox.curselection()
-        if selection:
-            self.animation_playhead = selection[0]
+        selection = self.anim_tree.selection()
+        if not selection:
+            return
+        index = self._group_index_for(selection[0])
+        if index is not None and index != self.animation_playhead:
+            self.animation_playhead = index
             self._refresh_animation_list()
+
+    def _rename_group(self, event=None):
+        """Double-click a group to give it a name of your own."""
+        item = self.anim_tree.identify_row(event.y) if event else None
+        index = self._group_index_for(item) if item else self.animation_playhead
+        if index is None or not (0 <= index < len(self.animation_steps)):
+            return "break"
+        group = self.animation_steps[index]
+
+        window = tk.Toplevel(self.root)
+        window.title("Group name")
+        window.transient(self.root)
+        window.configure(bg=self.C_PANEL)
+        tk.Label(window, text=f"Name for group {index}:", bg=self.C_PANEL,
+                 fg=self.C_TEXT, font=(self.UI_FONT, 9)).pack(padx=14, pady=(12, 6))
+        value = tk.StringVar(value=group.get("name", ""))
+        entry = tk.Entry(window, textvariable=value, font=(self.UI_FONT, 10), width=30,
+                         relief=tk.FLAT, highlightthickness=1,
+                         highlightbackground=self.C_BORDER, bg=self.C_SURFACE)
+        entry.pack(padx=14)
+        entry.focus_set()
+        entry.select_range(0, tk.END)
+
+        seconds = tk.StringVar(value=f"{group.get('duration', 2.0):.1f}")
+        time_row = tk.Frame(window, bg=self.C_PANEL)
+        time_row.pack(padx=14, pady=(8, 0), anchor="w")
+        tk.Label(time_row, text="Seconds:", bg=self.C_PANEL, fg=self.C_TEXT,
+                 font=(self.UI_FONT, 9)).pack(side=tk.LEFT)
+        tk.Spinbox(time_row, from_=0.0, to=15.0, increment=0.1, width=5,
+                   textvariable=seconds, font=(self.UI_FONT, 9)).pack(side=tk.LEFT, padx=6)
+
+        def accept(_event=None):
+            name = value.get().strip()
+            if name:
+                group["name"] = name
+                # A name of your own is never overwritten by renumbering, nor by the
+                # next action that joins this group.
+                group["named"] = True
+                group["custom_name"] = True
+            try:
+                group["duration"] = max(0.0, min(15.0, float(seconds.get())))
+            except Exception:
+                pass
+            self._refresh_animation_list()
+            window.destroy()
+
+        buttons = tk.Frame(window, bg=self.C_PANEL)
+        buttons.pack(padx=14, pady=12, fill=tk.X)
+        cfg = {"font": (self.UI_FONT, 8), "relief": tk.FLAT, "bg": self.C_BTN,
+               "fg": self.C_TEXT, "bd": 0, "highlightthickness": 1,
+               "highlightbackground": self.C_BORDER, "padx": 10, "pady": 3,
+               "cursor": "hand2"}
+        tk.Button(buttons, text="OK", command=accept, **cfg).pack(side=tk.RIGHT, padx=3)
+        tk.Button(buttons, text="Cancel", command=window.destroy,
+                  **cfg).pack(side=tk.RIGHT)
+        entry.bind("<Return>", accept)
+        window.bind("<Escape>", lambda _e: window.destroy())
+        window.grab_set()
+        return "break"
+
+    def set_group_time(self, index, seconds):
+        """The time one group takes. Zero is allowed and means an instant cut."""
+        if not (0 <= index < len(self.animation_steps)):
+            return False
+        try:
+            self.animation_steps[index]["duration"] = max(0.0, min(15.0, float(seconds)))
+        except Exception:
+            return False
+        self._refresh_animation_list()
+        return True
 
     def _on_step_time_changed(self, _value=None):
         """The slider is the time for all steps: moving it retimes the whole sequence.
         A single step can still be given its own interval by double-clicking it."""
-        duration = max(0.1, float(self.step_time_var.get()))
+        duration = max(0.0, float(self.step_time_var.get()))
         for step in self.animation_steps:
             step["duration"] = duration
         self._refresh_animation_list()
@@ -1606,12 +1967,14 @@ class FloorballTacticsApp:
         """The reason the sequence cannot be played or exported, or None."""
         if len(self.animation_steps) < 2:
             return ("Nothing to animate",
-                    "An animation needs at least two steps: the starting slide and "
-                    "somewhere to move to.\n\nArrange the board and press Add Step.")
-        if any(step.get("duration", 0) <= 0 for step in self.animation_steps):
+                    "An animation needs at least two groups: the board as it stands, "
+                    "and somewhere to move to.\n\nArrange the board, press Add Group, "
+                    "then move things.")
+        if sum(step.get("duration", 0) for step in self.animation_steps[1:]) <= 0:
             return ("No time set",
-                    "Every step needs a time interval greater than zero.\n\n"
-                    "Use the Time slider, or double-click a step to give it its own.")
+                    "Every group is set to zero seconds, so nothing would move.\n\n"
+                    "Use the Time slider, or double-click a group to time it. A single "
+                    "group at zero is fine -- it cuts straight to the next one.")
         return None
 
     def _step_positions(self, step):
@@ -1622,8 +1985,15 @@ class FloorballTacticsApp:
 
     def _apply_animation_frame(self, from_step, to_step, fraction):
         """Put every player where it should be a `fraction` of the way between two
-        keyframes. Positions are in rink metres, so this is correct at any window size
-        and in either rink orientation."""
+        keyframes, and bring in the drawings that belong to the group being entered.
+        Positions are in rink metres, so this is correct at any window size and in
+        either rink orientation."""
+        try:
+            to_index = self.animation_steps.index(to_step)
+        except ValueError:
+            to_index = None
+        if to_index is not None:
+            self._apply_drawn_for_frame(to_index, fraction)
         start = self._step_positions(from_step)
         end = self._step_positions(to_step)
         for label, (sx, sy) in start.items():
@@ -1647,6 +2017,76 @@ class FloorballTacticsApp:
                     self.canvas.move(item, dx, dy)
                 except Exception:
                     pass
+
+    def _apply_drawn_for_frame(self, to_index, fraction):
+        """Arrows, boxes, signs and labels take part in the animation: anything drawn in
+        a later group is hidden until the animation reaches it, and a line belonging to
+        the group being entered is drawn on over that group's time rather than simply
+        appearing."""
+        for cid, meta in list(self.drawn_items.items()):
+            group = meta.get("anim_group")
+            if group is None:
+                continue                      # drawn outside the animation: always on
+            try:
+                if group < to_index:
+                    self.canvas.itemconfig(cid, state=tk.NORMAL)
+                    self._restore_full_coords(cid, meta)
+                elif group > to_index:
+                    self.canvas.itemconfig(cid, state=tk.HIDDEN)
+                else:
+                    self._reveal_drawn_item(cid, meta, fraction)
+            except Exception:
+                pass
+
+    def _restore_full_coords(self, cid, meta):
+        full = meta.get("full_coords")
+        if full and self.canvas.type(cid) in ("line", "polygon"):
+            current = self.canvas.coords(cid)
+            if len(current) != len(full) or current != full:
+                self.canvas.coords(cid, *full)
+
+    def _reveal_drawn_item(self, cid, meta, fraction):
+        """A line is drawn on from its start; anything else appears as its group opens."""
+        if fraction <= 0:
+            self.canvas.itemconfig(cid, state=tk.HIDDEN)
+            return
+        self.canvas.itemconfig(cid, state=tk.NORMAL)
+        full = meta.get("full_coords")
+        if not full or self.canvas.type(cid) != "line" or len(full) < 4:
+            return
+        if fraction >= 1.0:
+            self.canvas.coords(cid, *full)
+            return
+        # Walk the line's own length and stop where the fraction falls, so a curve
+        # follows its curve rather than its chord.
+        points = [(full[i], full[i + 1]) for i in range(0, len(full) - 1, 2)]
+        spans = [math.hypot(b[0] - a[0], b[1] - a[1])
+                 for a, b in zip(points, points[1:])]
+        total = sum(spans)
+        if total <= 0:
+            return
+        wanted = total * fraction
+        drawn = [points[0]]
+        for (a, b), span in zip(zip(points, points[1:]), spans):
+            if wanted >= span:
+                drawn.append(b)
+                wanted -= span
+                continue
+            share = wanted / span if span else 0
+            drawn.append((a[0] + (b[0] - a[0]) * share, a[1] + (b[1] - a[1]) * share))
+            break
+        if len(drawn) >= 2:
+            self.canvas.coords(cid, *[value for point in drawn for value in point])
+
+    def show_all_drawn_items(self):
+        """Put every drawing back on the board at full length -- what the rink looks
+        like when the animation is not running."""
+        for cid, meta in list(self.drawn_items.items()):
+            try:
+                self.canvas.itemconfig(cid, state=tk.NORMAL)
+                self._restore_full_coords(cid, meta)
+            except Exception:
+                pass
 
     def play_animation(self):
         problem = self._animation_problem()
@@ -1675,8 +2115,9 @@ class FloorballTacticsApp:
             self.stop_animation(rewind=False)
             return
         step = self.animation_steps[index + 1]
-        duration = max(0.1, float(step.get("duration", 1.0)))
-        fraction = min(1.0, elapsed / duration)
+        duration = float(step.get("duration", 1.0))
+        # A group set to zero seconds is a cut: jump straight to it.
+        fraction = 1.0 if duration <= 0 else min(1.0, elapsed / duration)
         self._apply_animation_frame(self.animation_steps[index], step, fraction)
         self.animation_playhead = index if fraction < 1.0 else index + 1
         self._refresh_animation_list()
@@ -1706,6 +2147,9 @@ class FloorballTacticsApp:
             self._apply_animation_frame(self.animation_steps[0],
                                         self.animation_steps[0], 0.0)
             self.animation_playhead = 0
+        # Last, not first: the rewind frame above hides anything belonging to a later
+        # group, and a stopped board is a static board with everything on it.
+        self.show_all_drawn_items()
         self._refresh_animation_list()
 
     def export_animation_gif(self):
@@ -1755,6 +2199,7 @@ class FloorballTacticsApp:
             messagebox.showerror("Export failed", f"Could not write the GIF:\n{error}")
         finally:
             self._restore_board(restore)
+            self.show_all_drawn_items()
             self.canvas.update()
 
     def _capture_canvas(self):
@@ -2097,59 +2542,63 @@ class FloorballTacticsApp:
         roster_frame.pack(side=tk.LEFT, padx=3, pady=2, fill=tk.Y)
         self._roster_frame = roster_frame
 
-        att_row = tk.Frame(roster_frame, bg=self.C_PANEL)
-        att_row.pack(fill=tk.X, pady=2)
-        tk.Label(att_row, text="Atk:", bg=self.C_PANEL, font=(self.UI_FONT, 8, "bold"), width=3, anchor="w").pack(side=tk.LEFT)
-        self.att_spinbox = tk.Spinbox(att_row, from_=1, to=10, width=2, command=self._update_roster, font=(self.UI_FONT, 8))
-        self.att_spinbox.delete(0, tk.END)
-        self.att_spinbox.insert(0, "5")
-        self.att_spinbox.pack(side=tk.LEFT, padx=1)
-        self.att_shape_var = tk.StringVar(value="Square")
-        ttk.Combobox(att_row, textvariable=self.att_shape_var, values=["Square", "Circle", "X", "Triangle", "Plus"], width=7, font=(self.UI_FONT, 8), style="Toolbar.TCombobox").pack(side=tk.LEFT, padx=1, expand=True, fill=tk.X)
-        self.btn_att_color = tk.Button(att_row, text="", command=self.choose_att_color, **swatch_cfg)
+        # A grid, so both team rows line up exactly: same label width, same count box,
+        # same shape bar, same swatch. The player size sits in a column of its own,
+        # spanning the two rows, because it belongs to neither team in particular.
+        roster_grid = tk.Frame(roster_frame, bg=self.C_PANEL)
+        roster_grid.pack(fill=tk.BOTH, expand=True)
+
+        def team_row(row, caption, count_command, shape_value, color_command):
+            tk.Label(roster_grid, text=caption, bg=self.C_PANEL,
+                     font=(self.UI_FONT, 8, "bold"), width=3, anchor="w").grid(
+                row=row, column=0, sticky="w", pady=2)
+            count = tk.Spinbox(roster_grid, from_=1, to=10, width=2,
+                               command=count_command, font=(self.UI_FONT, 8))
+            count.delete(0, tk.END)
+            count.insert(0, "5")
+            count.grid(row=row, column=1, padx=1, pady=2)
+            shape = tk.StringVar(value=shape_value)
+            ttk.Combobox(roster_grid, textvariable=shape,
+                         values=["Square", "Circle", "X", "Triangle", "Plus"],
+                         width=8, font=(self.UI_FONT, 8),
+                         style="Toolbar.TCombobox").grid(row=row, column=2,
+                                                        padx=2, pady=2, sticky="ew")
+            swatch = tk.Button(roster_grid, text="", command=color_command, **swatch_cfg)
+            swatch._is_swatch = True
+            swatch.grid(row=row, column=3, padx=1, pady=2)
+            return count, shape, swatch
+
+        (self.att_spinbox, self.att_shape_var,
+         self.btn_att_color) = team_row(0, "Atk:", self._roster_count_changed,
+                                        "Square", self.choose_att_color)
         self.btn_att_color.config(bg=self.att_color)
-        self.btn_att_color._is_swatch = True
-        self.btn_att_color.pack(side=tk.LEFT, padx=1)
-        tk.Label(att_row, text="Size:", bg=self.C_PANEL, font=(self.UI_FONT, 8, "bold"), anchor="w").pack(side=tk.LEFT, padx=(6, 0))
-        self.player_size_spinbox = tk.Spinbox(att_row, from_=6, to=60, width=3, textvariable=self.player_size_var, command=self._resize_selected_players, font=(self.UI_FONT, 8))
-        self.player_size_spinbox.pack(side=tk.LEFT, padx=1)
+        (self.def_spinbox, self.def_shape_var,
+         self.btn_def_color) = team_row(1, "Def:", self._roster_count_changed,
+                                        "Circle", self.choose_def_color)
+        self.btn_def_color.config(bg=self.def_color)
+
+        for shape_var in (self.att_shape_var, self.def_shape_var):
+            shape_var.trace_add("write", lambda *_a: self._roster_shape_changed())
+
+        size_cell = tk.Frame(roster_grid, bg=self.C_PANEL)
+        size_cell.grid(row=0, column=4, rowspan=2, padx=(8, 0), sticky="ns")
+        tk.Label(size_cell, text="Size", bg=self.C_PANEL,
+                 font=(self.UI_FONT, 8, "bold")).pack()
+        self.player_size_spinbox = tk.Spinbox(size_cell, from_=6, to=60, width=3,
+                                              textvariable=self.player_size_var,
+                                              command=self._resize_selected_players,
+                                              font=(self.UI_FONT, 8))
+        self.player_size_spinbox.pack(pady=(1, 0))
         # `command` only fires for the little arrows. Typing a number and pressing
         # Return, or clicking away, has to work as well.
         self.player_size_spinbox.bind("<Return>", self._resize_selected_players)
         self.player_size_spinbox.bind("<FocusOut>", self._resize_selected_players)
-
-        def_row = tk.Frame(roster_frame, bg=self.C_PANEL)
-        def_row.pack(fill=tk.X, pady=2)
-        tk.Label(def_row, text="Def:", bg=self.C_PANEL, font=(self.UI_FONT, 8, "bold"), width=3, anchor="w").pack(side=tk.LEFT)
-        self.def_spinbox = tk.Spinbox(def_row, from_=1, to=10, width=2, command=self._update_roster, font=(self.UI_FONT, 8))
-        self.def_spinbox.delete(0, tk.END)
-        self.def_spinbox.insert(0, "5")
-        self.def_spinbox.pack(side=tk.LEFT, padx=1)
-        self.def_shape_var = tk.StringVar(value="Circle")
-        ttk.Combobox(def_row, textvariable=self.def_shape_var, values=["Square", "Circle", "X", "Triangle", "Plus"], width=7, font=(self.UI_FONT, 8), style="Toolbar.TCombobox").pack(side=tk.LEFT, padx=1, expand=True, fill=tk.X)
-        self.btn_def_color = tk.Button(def_row, text="", command=self.choose_def_color, **swatch_cfg)
-        self.btn_def_color.config(bg=self.def_color)
-        self.btn_def_color._is_swatch = True
-        self.btn_def_color.pack(side=tk.LEFT, padx=1)
+        roster_grid.columnconfigure(2, weight=1)
 
 
-        signs_frame = ttk.LabelFrame(self.top_inner, style="Toolbar.TLabelframe", text=" Signs ", padding=5)
+        signs_frame = ttk.LabelFrame(self.top_inner, style="Toolbar.TLabelframe", text=" Shapes ", padding=5)
         signs_frame.pack(side=tk.LEFT, padx=3, pady=2, fill=tk.Y)
         self._signs_frame = signs_frame
-        sign_size_row = tk.Frame(signs_frame, bg=self.C_PANEL)
-        sign_size_row.pack(fill=tk.X, pady=2)
-        tk.Label(sign_size_row, text="Size:", bg=self.C_PANEL, font=(self.UI_FONT, 8, "bold"), width=3, anchor="w").pack(side=tk.LEFT)
-        self.sign_size_spinbox = tk.Spinbox(sign_size_row, from_=6, to=60, width=3,
-                                            textvariable=self.sign_size_var,
-                                            command=self._apply_sign_size,
-                                            font=(self.UI_FONT, 8))
-        self.sign_size_spinbox.pack(side=tk.LEFT, padx=1)
-        self.sign_size_spinbox.bind("<Return>", self._apply_sign_size)
-        self.sign_size_spinbox.bind("<FocusOut>", self._apply_sign_size)
-        self.btn_sign_color = tk.Button(sign_size_row, text="", command=self.choose_sign_color, **swatch_cfg)
-        self.btn_sign_color.config(bg=self.sign_color)
-        self.btn_sign_color._is_swatch = True
-        self.btn_sign_color.pack(side=tk.LEFT, padx=1)
         # One grid of three uniform columns, so every button in the box is the same
         # width whatever its label -- including Text and Image, and including the row
         # that carries the text-size field in its third cell.
@@ -2172,18 +2621,25 @@ class FloorballTacticsApp:
         tk.Button(sign_grid, text="Image", command=self.add_board_image,
                   **sign_btn_cfg).grid(row=2, column=1, padx=3, pady=2, sticky="ew")
 
-        text_size_cell = tk.Frame(sign_grid, bg=self.C_PANEL)
-        text_size_cell.grid(row=2, column=2, padx=3, pady=2, sticky="ew")
-        tk.Label(text_size_cell, text="Txt", bg=self.C_PANEL, fg=self.C_TEXT,
+        # Size and colour take the third cell of the last row -- one dial for every
+        # shape in this box, text included, instead of a separate row above and a
+        # second text-only field beside it.
+        size_cell = tk.Frame(sign_grid, bg=self.C_PANEL)
+        size_cell.grid(row=2, column=2, padx=3, pady=2, sticky="ew")
+        tk.Label(size_cell, text="Size", bg=self.C_PANEL, fg=self.C_TEXT,
                  font=(self.UI_FONT, 8, "bold")).pack(side=tk.LEFT)
-        self.text_size_spinbox = tk.Spinbox(text_size_cell, from_=self.TEXT_MIN_SIZE,
-                                            to=self.TEXT_MAX_SIZE, width=3,
-                                            textvariable=self.text_size_var,
-                                            command=self._apply_text_size,
+        self.sign_size_spinbox = tk.Spinbox(size_cell, from_=6, to=60, width=3,
+                                            textvariable=self.sign_size_var,
+                                            command=self._apply_sign_size,
                                             font=(self.UI_FONT, 8))
-        self.text_size_spinbox.pack(side=tk.LEFT, padx=(3, 0), fill=tk.X, expand=True)
-        self.text_size_spinbox.bind("<Return>", self._apply_text_size)
-        self.text_size_spinbox.bind("<FocusOut>", self._apply_text_size)
+        self.sign_size_spinbox.pack(side=tk.LEFT, padx=(3, 0), fill=tk.X, expand=True)
+        self.sign_size_spinbox.bind("<Return>", self._apply_sign_size)
+        self.sign_size_spinbox.bind("<FocusOut>", self._apply_sign_size)
+        self.btn_sign_color = tk.Button(size_cell, text="", command=self.choose_sign_color,
+                                        **swatch_cfg)
+        self.btn_sign_color.config(bg=self.sign_color)
+        self.btn_sign_color._is_swatch = True
+        self.btn_sign_color.pack(side=tk.LEFT, padx=(3, 0))
         for column in range(3):
             sign_grid.columnconfigure(column, weight=1, uniform="sign")
 
@@ -2334,34 +2790,46 @@ class FloorballTacticsApp:
         t_sub = tk.Frame(timeline_frame, bg=self.C_PANEL)
         t_sub.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-        # One list, not two. Every action that changes the board writes a step here and
-        # each step carries its own time, so the timeline and the animation are the
-        # same thing rather than two views that drifted apart.
+        # A tree, not a list: a group is a heading in bold that can be collapsed, with
+        # the actions it contains underneath. A Listbox has one font for every row and
+        # no notion of a parent, so neither bold headings nor folding were possible.
         anim_column = tk.Frame(t_sub, bg=self.C_PANEL)
         anim_column.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=2)
-        # The playhead is a red row in this list -- the point playback starts from.
-        self.anim_listbox = tk.Listbox(anim_column, font=(self.UI_FONT, 8), selectmode=tk.SINGLE,
-                                       height=7, width=26, relief=tk.FLAT, bd=0,
-                                       highlightthickness=1, highlightbackground=self.C_BORDER,
-                                       bg=self.C_SURFACE, fg=self.C_TEXT,
-                                       selectbackground=self.C_ACCENT,
-                                       selectforeground=self.C_ACCENT_FG)
-        self.anim_listbox.pack(fill=tk.BOTH, expand=True, pady=(1, 2))
+
+        style = ttk.Style()
+        style.configure("Timeline.Treeview", background=self.C_SURFACE,
+                        fieldbackground=self.C_SURFACE, foreground=self.C_TEXT,
+                        font=(self.UI_FONT, 8), rowheight=17, borderwidth=0)
+        style.layout("Timeline.Treeview", [("Timeline.Treeview.treearea",
+                                            {"sticky": "nswe"})])
+
+        self.anim_tree = ttk.Treeview(anim_column, style="Timeline.Treeview",
+                                      columns=("time",), show="tree", height=8,
+                                      selectmode="browse")
+        # Narrow by request, wide by expansion: the timeline takes whatever the two
+        # rows of boxes leave over, so asking for less here keeps Tactics intact.
+        self.anim_tree.column("#0", width=120, minwidth=90, stretch=True)
+        self.anim_tree.column("time", width=40, minwidth=36, anchor="e", stretch=False)
+        self.anim_tree.tag_configure("group", font=(self.UI_FONT, 8, "bold"))
+        self.anim_tree.tag_configure("playhead", background=self.PLAYHEAD_COLOR,
+                                     foreground="#ffffff")
+        self.anim_tree.tag_configure("action", foreground=self.C_MUTED)
+        self.anim_tree.pack(fill=tk.BOTH, expand=True, pady=(1, 2))
         # The old action log lives on off-screen: commands still record and un-record
-        # their lines through it, and those lines are what name the steps above.
+        # their lines through it, and those lines are what name the groups above.
         self.steps_listbox = tk.Listbox(t_sub)
-        self.anim_listbox.bind("<<ListboxSelect>>", self._on_anim_step_selected)
-        self.anim_listbox.bind("<Double-Button-1>", self._edit_step_time)
+        self.anim_tree.bind("<<TreeviewSelect>>", self._on_anim_step_selected)
+        self.anim_tree.bind("<Double-Button-1>", self._rename_group)
         # Drag and drop to reorder.
-        self.anim_listbox.bind("<ButtonPress-1>", self._anim_drag_start)
-        self.anim_listbox.bind("<B1-Motion>", self._anim_drag_motion)
-        self.anim_listbox.bind("<ButtonRelease-1>", self._anim_drag_end)
+        self.anim_tree.bind("<ButtonPress-1>", self._anim_drag_start)
+        self.anim_tree.bind("<B1-Motion>", self._anim_drag_motion)
+        self.anim_tree.bind("<ButtonRelease-1>", self._anim_drag_end)
 
         time_row = tk.Frame(anim_column, bg=self.C_PANEL)
         time_row.pack(fill=tk.X)
         tk.Label(time_row, text="Time", bg=self.C_PANEL, fg=self.C_TEXT,
                  font=(self.UI_FONT, 7)).pack(side=tk.LEFT)
-        self.step_time_scale = tk.Scale(time_row, from_=0.2, to=10.0, resolution=0.1,
+        self.step_time_scale = tk.Scale(time_row, from_=0.0, to=10.0, resolution=0.1,
                                         orient=tk.HORIZONTAL, variable=self.step_time_var,
                                         bg=self.C_PANEL, fg=self.C_TEXT,
                                         troughcolor=self.C_SURFACE, highlightthickness=0,
@@ -2369,19 +2837,25 @@ class FloorballTacticsApp:
                                         command=self._on_step_time_changed)
         self.step_time_scale.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(3, 0))
 
+        # The slider retimes every step at once; this field is the selected step's own
+        # interval, so a single step can be lengthened without hunting for the
+        # double-click.
+        # No separate per-group time field: double-clicking a group opens one dialog
+        # carrying both its name and its seconds, which is where the two belong.
+
         anim_buttons = tk.Frame(timeline_frame, bg=self.C_PANEL)
         anim_buttons.pack(side=tk.LEFT, fill=tk.Y, padx=(4, 0))
         transport_cfg = {k: v for k, v in gray_btn_cfg.items() if k != "width"}
         # One button per row, one column, uniform width: every transport button ends up
         # the same length whatever its label.
         for row, (label, command) in enumerate((
-                ("Add Step", self.add_animation_step),
                 ("Play", self.play_animation),
                 ("Pause", self.pause_animation),
                 ("Stop", self.stop_animation),
+                ("Add Group", self.add_animation_step),
+                ("Del Group", self.delete_animation_step),
                 ("Up", lambda: self.move_animation_step(-1)),
-                ("Down", lambda: self.move_animation_step(1)),
-                ("Del Step", self.delete_animation_step))):
+                ("Down", lambda: self.move_animation_step(1)))):
             button = tk.Button(anim_buttons, text=label, command=command, **transport_cfg)
             button.grid(row=row, column=0, sticky="ew", padx=1, pady=1)
             self.anim_buttons[label] = button
@@ -2445,14 +2919,14 @@ class FloorballTacticsApp:
         "Reset": "Clear the board back to the starting formations, with no drawings, "
                  "watermark, timeline or animation steps. Asks first.",
         # Animation transport
-        "Add Step": "Freeze the board as the next animation step. The first one also "
-                    "records the opening slide, step 0.",
-        "Play": "Play the animation from the red step.",
+        "Add Group": "Close the current group and start the next one. Everything in a "
+                     "group happens at the same time when the animation plays.",
+        "Play": "Play the animation from the red group.",
         "Pause": "Pause where it is. Play carries on from the same point.",
-        "Stop": "Stop and return to the opening slide.",
-        "Del Step": "Delete the step the red marker is on.",
-        "Up": "Move the selected step one place earlier in the sequence.",
-        "Down": "Move the selected step one place later in the sequence.",
+        "Stop": "Stop and return to group 0.",
+        "Del Group": "Delete the group the red marker is on.",
+        "Up": "Move the selected group one place earlier in the sequence.",
+        "Down": "Move the selected group one place later in the sequence.",
         # Board settings
         "Full": "Switch to the half rink.",
         "Half": "Switch back to the full rink.",
@@ -2480,8 +2954,8 @@ class FloorballTacticsApp:
         "Square": "Stamp a square marker.",
         "Triangle": "Stamp a triangle marker.",
         "Plus": "Stamp a plus marker.",
-        "Text": "Place a text label: click the board, then type. Uses the Txt size and "
-                "the sign colour.",
+        "Text": "Place a text label: click the board, then type. Uses the Size dial "
+                "and the colour beside it.",
         "Image": "Put a picture on the board. Drag it to move it, or drag a corner "
                  "handle to scale it.",
         # Drawing tools
@@ -2492,7 +2966,7 @@ class FloorballTacticsApp:
         "Run": "Draw a run without the ball.",
         "Line": "Draw a plain straight line.",
         "Bend": "Draw a curve: click the start, the bend, then the end.",
-        "Box": "Draw a filled box.",
+        "Box": "Draw a square outline.",
         "Rect": "Draw a rectangle outline.",
         "Circle": "Draw a circle.",
         "Oval": "Draw an oval.",
@@ -3056,7 +3530,65 @@ class FloorballTacticsApp:
         self._save_config()
         return True
 
+    def _settings_snapshot(self):
+        """Everything the Preferences dialog can change, as it stands right now."""
+        return {
+            "half_rink": bool(self.half_rink_var.get()),
+            "arches": bool(self.curved_arches_var.get()),
+            "goals": bool(self.goals_visible_var.get()),
+            "snap_player": bool(self.snap_player_var.get()),
+            "snap_angle": bool(self.snap_angle_var.get()),
+            "grid": bool(self.grid_var.get()),
+            "ghosting": bool(self.ghosting_var.get()),
+            "menu_rows_mode": self.menu_rows_mode,
+            "menu_position": self.menu_position,
+            "color_theme": self.color_theme,
+            "att_color": self.att_color,
+            "def_color": self.def_color,
+            "line_color": self.line_color,
+            "sign_color": self.sign_color,
+        }
+
+    def _restore_settings(self, snapshot):
+        """Put the board back the way `_settings_snapshot` found it."""
+        if not snapshot:
+            return
+        for name, variable in (("half_rink", self.half_rink_var),
+                               ("arches", self.curved_arches_var),
+                               ("goals", self.goals_visible_var),
+                               ("snap_player", self.snap_player_var),
+                               ("snap_angle", self.snap_angle_var),
+                               ("grid", self.grid_var),
+                               ("ghosting", self.ghosting_var)):
+            variable.set(snapshot[name])
+        if snapshot["color_theme"] != self.color_theme:
+            self.apply_color_theme(snapshot["color_theme"])
+        # The individual pickers may have moved a colour without changing the theme.
+        self.att_color = snapshot["att_color"]
+        self.def_color = snapshot["def_color"]
+        self.line_color = snapshot["line_color"]
+        self.sign_color = snapshot["sign_color"]
+        for attribute, colour in (("btn_att_color", self.att_color),
+                                  ("btn_def_color", self.def_color),
+                                  ("btn_line_color", self.line_color),
+                                  ("btn_sign_color", self.sign_color)):
+            swatch = getattr(self, attribute, None)
+            if swatch is not None:
+                try:
+                    swatch.config(bg=colour)
+                except Exception:
+                    pass
+        if snapshot["menu_rows_mode"] != self.menu_rows_mode:
+            self.set_menu_rows_mode(snapshot["menu_rows_mode"])
+        if snapshot["menu_position"] != self.menu_position:
+            self.set_menu_position(snapshot["menu_position"])
+        self.toggle_grid_visuals()
+        self._update_indicators()
+        self.redraw_canvas()
+        self._save_config()
+
     def open_preferences(self):
+        before = self._settings_snapshot()
         win = tk.Toplevel(self.root)
         win.title("Preferences")
         win.transient(self.root)
@@ -3132,8 +3664,19 @@ class FloorballTacticsApp:
             self._save_config()
             win.destroy()
 
+        def cancel():
+            """Put back everything the dialog changed.
+
+            The checkboxes are bound straight to the board's own variables and the
+            theme picker applies as it is chosen, so the settings are already live by
+            the time this button is pressed -- Cancel has to undo them rather than
+            simply close the window."""
+            self._restore_settings(before)
+            win.destroy()
+
         tk.Button(btns, text="Save & Close", command=apply_and_close, width=self.BTN_W).pack(side=tk.LEFT, padx=6)
-        tk.Button(btns, text="Cancel", command=win.destroy, width=self.BTN_W).pack(side=tk.LEFT, padx=6)
+        tk.Button(btns, text="Cancel", command=cancel, width=self.BTN_W).pack(side=tk.LEFT, padx=6)
+        win.protocol("WM_DELETE_WINDOW", cancel)
 
     def _update_roster(self, event=None):
         for token_id in list(self.tokens.keys()):
@@ -3471,11 +4014,9 @@ class FloorballTacticsApp:
             best_pt = (x, y)
             min_dist = float('inf')
             for token in tokens:
-                sid = token["shape_id"]
-                # bbox, not coords: a square player is a polygon and a cross is a
-                # line, so coords() is 8 or 4 numbers and unpacking it as a box
-                # raised ValueError -- snapping simply died on those shapes.
-                box = self.canvas.bbox(sid)
+                # The same square the ball snaps to, so a line end and a ball land on
+                # the same place for every shape.
+                box = self._token_snap_box(token)
                 if not box:
                     continue
                 x1_t, y1_t, x2_t, y2_t = box
@@ -3502,6 +4043,30 @@ class FloorballTacticsApp:
 
     BALL_SNAP_MARGIN = 26.0     # how far outside a player the ball still clicks on
 
+    def _token_box(self, token):
+        """The extent of everything the token is drawn from.
+
+        bbox(shape_id) is not it: for a plus that is the first stroke alone (a flat
+        36x8 box), and for the filled shapes it varies with the stroke width."""
+        boxes = [self.canvas.bbox(item) for item in self._token_items(token)]
+        boxes = [box for box in boxes if box]
+        if not boxes:
+            return None
+        return (min(b[0] for b in boxes), min(b[1] for b in boxes),
+                max(b[2] for b in boxes), max(b[3] for b in boxes))
+
+    def _token_snap_box(self, token):
+        """The square a player snaps against: its centre, plus its nominal size in
+        every direction. Derived from the size rather than the drawing, so a circle, a
+        square, a triangle, an X and a plus of the same size all snap identically --
+        they used to differ by up to 12px because each shape paints a different box."""
+        box = self._token_box(token)
+        if not box:
+            return None
+        cx, cy = (box[0] + box[2]) / 2.0, (box[1] + box[3]) / 2.0
+        half = max(4.0, float(token.get("size", 14)))
+        return (cx - half, cy - half, cx + half, cy + half)
+
     def get_ball_snap_point(self, x, y):
         """Snap the ball onto the middle of the nearest player edge.
 
@@ -3520,7 +4085,7 @@ class FloorballTacticsApp:
             if sid is None or sid in seen:
                 continue
             seen.add(sid)
-            box = self.canvas.bbox(sid)
+            box = self._token_snap_box(token)
             if not box:
                 continue
             x1, y1, x2, y2 = box
@@ -3728,6 +4293,10 @@ class FloorballTacticsApp:
                                             "color": color, "size": size_value,
                                             "group": group_tag,
                                             "decor": cid in decor_items})
+        if created and not getattr(self, "_replaying_sign", False):
+            description = f"Sign {sign_type}"
+            self.record_action_in_group(description)
+            self.tag_items_with_group(created, description)
         return created
 
     def on_canvas_press(self, event):
@@ -3795,6 +4364,8 @@ class FloorballTacticsApp:
             # the ghost back along with the movement.
             self._drag_ghosts = (self.create_ghosts(self.selected_tokens)
                                  if self.ghosting_var.get() else [])
+            # Shift at the start of the drag decides whether attached lines travel.
+            self._drag_keep_attached = (event.state & 0x1) != 0
             
             self.drag_data["x"] = event.x
             self.drag_data["y"] = event.y
@@ -3928,16 +4499,20 @@ class FloorballTacticsApp:
                     self.canvas.move(item, dx, dy)
                 if "text_ids" in token:
                     for tid in token["text_ids"]: self.canvas.move(tid, dx, dy)
-                for line_id in token.get("attached_lines_start", []):
-                    coords = self.canvas.coords(line_id)
-                    if coords and len(coords) >= 4:
-                        coords[0] += dx; coords[1] += dy
-                        self.canvas.coords(line_id, *coords)
-                for line_id in token.get("attached_lines_end", []):
-                    coords = self.canvas.coords(line_id)
-                    if coords and len(coords) >= 4:
-                        coords[-2] += dx; coords[-1] += dy
-                        self.canvas.coords(line_id, *coords)
+                # Snapping is what tied the arrow to the player in the first place;
+                # dragging the player is normally a repositioning, not a redraw of the
+                # play, so the arrow stays where it was. Hold Shift to bring it along.
+                if getattr(self, "_drag_keep_attached", False):
+                    for line_id in token.get("attached_lines_start", []):
+                        coords = self.canvas.coords(line_id)
+                        if coords and len(coords) >= 4:
+                            coords[0] += dx; coords[1] += dy
+                            self.canvas.coords(line_id, *coords)
+                    for line_id in token.get("attached_lines_end", []):
+                        coords = self.canvas.coords(line_id)
+                        if coords and len(coords) >= 4:
+                            coords[-2] += dx; coords[-1] += dy
+                            self.canvas.coords(line_id, *coords)
 
             self.drag_data["x"] = event.x
             self.drag_data["y"] = event.y
@@ -4052,7 +4627,9 @@ class FloorballTacticsApp:
                 # past where you dropped them. We only want the command
                 # recorded for undo/redo, not re-applied now.
                 cmd = MoveTokensCommand(self, label_moves,
-                                        ghosts=getattr(self, "_drag_ghosts", None))
+                                        ghosts=getattr(self, "_drag_ghosts", None),
+                                        keep_attached=getattr(
+                                            self, "_drag_keep_attached", False))
                 self._drag_ghosts = []
                 self.push_command(cmd, execute=False)
             self.drag_start_positions.clear()
@@ -4545,14 +5122,17 @@ class FloorballTacticsApp:
                 continue
             if meta.get("type") == "image":
                 continue                      # a picture has no fill to recolour
-            try:
-                if cid in self.selected_drawn:
-                    self.canvas.itemconfig(cid, fill="#228be6", outline="#228be6")
-                else:
-                    color = meta.get("color", self.line_color)
-                    self.canvas.itemconfig(cid, fill=color, outline=color)
-            except Exception:
-                pass
+            # Only the options that actually carry this item's colour. A blanket fill=
+            # floods every outline-only shape -- ovals, circles, boxes, rectangles,
+            # square and triangle signs -- solid the moment anything is selected or
+            # deselected. clear_selection already knew this; this path did not.
+            colour = ("#228be6" if cid in self.selected_drawn
+                      else meta.get("color", self.line_color))
+            for option in meta.get("color_options") or ("fill",):
+                try:
+                    self.canvas.itemconfig(cid, **{option: colour})
+                except Exception:
+                    pass
         self._draw_selection_overlay()
 
     def draw_tactical_line_canvas(self, tool, x1, y1, x2, y2, preview=False, extra_data=None):
@@ -4721,7 +5301,9 @@ class FloorballTacticsApp:
     FORMATIONS = {
         "Dice":     [("LD", 0.25, 0.00), ("RD", 0.75, 0.00), ("C", 0.50, 0.50),
                      ("LA", 0.25, 1.00), ("RA", 0.75, 1.00)],
-        "House":    [("LD", 0.30, 0.00), ("RD", 0.70, 0.00), ("LW", 0.15, 0.55),
+        # The defenders sit wide, near the boards, rather than tucked in beside each
+        # other -- that is what makes the house shape a house.
+        "House":    [("LD", 0.12, 0.00), ("RD", 0.88, 0.00), ("LW", 0.15, 0.55),
                      ("RW", 0.85, 0.55), ("T", 0.50, 1.00)],
         "Point":    [("P", 0.50, 0.00), ("LW", 0.15, 0.50), ("RW", 0.85, 0.50),
                      ("LA", 0.30, 1.00), ("RA", 0.70, 1.00)],
