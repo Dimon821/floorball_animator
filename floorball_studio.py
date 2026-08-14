@@ -1,8 +1,10 @@
-# floorball_studio.py
+# floorball_animator.py
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog, colorchooser
 from tkinter import font as tkfont
 from PIL import Image, ImageTk, ImageDraw, ImageChops
+import copy
+import importlib
 import math
 import os
 import io
@@ -10,7 +12,14 @@ import base64
 import datetime
 import json
 import pathlib
+import platform
+import subprocess
+import sys
 import time
+import traceback
+import urllib.parse
+import webbrowser
+from collections import deque
 
 # ==========================================
 # COMMAND PATTERN ABSTRACTIONS
@@ -319,6 +328,234 @@ class MoveDrawnCommand(Command):
     def serialize(self):
         return {"type": "move_drawn", "moves": self.id_moves}
 
+class DeleteAnimationActionCommand(Command):
+    """Taking one action out of a group, and the marks it put on the board with it.
+
+    Undoable like everything else the board does: a timeline is edited by trying
+    things, and a delete that could not be taken back meant redrawing an arrow by
+    hand. What went is kept as geometry in metres, the same form a saved play uses,
+    so undo rebuilds it exactly where it was however the window has changed since."""
+
+    def __init__(self, app, group_index, position):
+        self.app = app
+        self.group_index = group_index
+        self.position = position
+        self.description = None
+        self.detail = None
+        self.drawings = []
+        self.unremoved = []
+        self.step_desc = "Delete timeline action"
+
+    def execute(self):
+        app = self.app
+        if not (0 <= self.group_index < len(app.animation_steps)):
+            return
+        group = app.animation_steps[self.group_index]
+        actions = group.get("actions") or []
+        if not (0 <= self.position < len(actions)):
+            return
+        details = app._action_details(group)
+        self.detail = details[self.position] if self.position < len(details) else None
+        self.description = actions.pop(self.position)
+        if self.position < len(details):
+            details.pop(self.position)
+        if self.description.startswith("Remove "):
+            # The row *is* a removal, so taking it out puts the mark back into the
+            # play rather than deleting anything.
+            name = self.description[len("Remove "):]
+            self.unremoved = []
+            for cid, meta in list(app.drawn_items.items()):
+                if (meta.get("anim_remove_group") == self.group_index
+                        and app._drawn_label(cid) == name):
+                    meta.pop("anim_remove_group", None)
+                    self.unremoved.append(cid)
+            app.show_all_drawn_items()
+            app._refresh_animation_list()
+            return
+        doomed = [cid for cid, meta in app.drawn_items.items()
+                  if meta.get("anim_group") == self.group_index
+                  and meta.get("anim_action") == self.description]
+        self.drawings = app._drawings_snapshot(only=set(doomed))
+        for cid in doomed:
+            try:
+                app.canvas.delete(cid)
+            except Exception:
+                pass
+            app.drawn_items.pop(cid, None)
+            app.board_images.pop(cid, None)
+        app._refresh_animation_list()
+
+    def undo(self):
+        app = self.app
+        if self.description is None:
+            return
+        if not (0 <= self.group_index < len(app.animation_steps)):
+            return
+        group = app.animation_steps[self.group_index]
+        actions = group.setdefault("actions", [])
+        at = min(self.position, len(actions))
+        actions.insert(at, self.description)
+        details = group.setdefault("action_details", [])
+        while len(details) < at:
+            details.append(None)
+        details.insert(at, self.detail)
+        for cid in self.unremoved:
+            meta = app.drawn_items.get(cid)
+            if meta is not None:
+                meta["anim_remove_group"] = self.group_index
+        for entry in self.drawings:
+            app._rebuild_drawing(entry)
+        app.show_all_drawn_items()
+        app._refresh_animation_list()
+
+    def serialize(self):
+        return {"type": "delete_animation_action", "group": self.group_index,
+                "position": self.position}
+
+
+class DeleteAnimationStepCommand(Command):
+    """Deleting a whole group, and putting it back.
+
+    The group itself is plain data and travels as a copy. The marks need more care:
+    a group's number is what every drawing points at, so removing one from the middle
+    renumbers the rest, and the old numbers are kept here so undo can restore exactly
+    what each drawing belonged to."""
+
+    def __init__(self, app, index):
+        self.app = app
+        self.index = index
+        self.group = None
+        self.tags = {}
+        self.playhead = 0
+        self.step_desc = "Delete timeline group"
+
+    def _tag_snapshot(self):
+        return {cid: (meta.get("anim_group"), meta.get("anim_remove_group"))
+                for cid, meta in self.app.drawn_items.items()}
+
+    def execute(self):
+        app = self.app
+        if not (0 <= self.index < len(app.animation_steps)):
+            return
+        self.tags = self._tag_snapshot()
+        self.playhead = app.animation_playhead
+        self.group = copy.deepcopy(app.animation_steps[self.index])
+        app.animation_steps.pop(self.index)
+        # Everything after the hole moves down one, and whatever belonged to the group
+        # that went joins the one before it -- so a mark that was on the board stays on
+        # the board rather than pointing at a group that no longer exists.
+        for meta in app.drawn_items.values():
+            for key in ("anim_group", "anim_remove_group"):
+                value = meta.get(key)
+                if value is None:
+                    continue
+                if value > self.index:
+                    meta[key] = value - 1
+                elif value == self.index:
+                    meta[key] = max(0, self.index - 1) if key == "anim_group" else None
+                    if meta[key] is None:
+                        meta.pop(key, None)
+        app._renumber_animation_steps()
+        app.animation_playhead = max(0, min(app.animation_playhead,
+                                            len(app.animation_steps) - 1))
+        app._refresh_animation_list()
+
+    def undo(self):
+        app = self.app
+        if self.group is None:
+            return
+        app.animation_steps.insert(min(self.index, len(app.animation_steps)),
+                                   copy.deepcopy(self.group))
+        for cid, (group, removed) in self.tags.items():
+            meta = app.drawn_items.get(cid)
+            if meta is None:
+                continue
+            if group is None:
+                meta.pop("anim_group", None)
+            else:
+                meta["anim_group"] = group
+            if removed is None:
+                meta.pop("anim_remove_group", None)
+            else:
+                meta["anim_remove_group"] = removed
+        app._renumber_animation_steps()
+        app.animation_playhead = self.playhead
+        app.show_all_drawn_items()
+        app._refresh_animation_list()
+
+    def serialize(self):
+        return {"type": "delete_animation_step", "index": self.index}
+
+
+class EditMovementCommand(Command):
+    """Typing an action's movements straight into the timeline.
+
+    An action carries what it did, and the group snapshots carry where everyone stands
+    at each boundary; both have to be told. The snapshots only take the ends of a
+    player's travel through a group -- if the same player is moved twice in one group,
+    the first move owns the start and the second owns the finish, and the waypoint
+    between them belongs to neither snapshot."""
+
+    def __init__(self, app, group_index, position, movements):
+        self.app = app
+        self.group_index = group_index
+        self.position = position
+        self.movements = [[label, list(start), list(end)]
+                          for label, start, end in movements]
+        self.before = None
+        self.step_desc = "Edit movement"
+
+    def _snapshot(self):
+        app = self.app
+        group = app.animation_steps[self.group_index]
+        details = app._action_details(group)
+        return {
+            "detail": copy.deepcopy(details[self.position])
+            if self.position < len(details) else None,
+            "positions": [(label,
+                           app._group_position(self.group_index - 1, label),
+                           app._group_position(self.group_index, label))
+                          for label, _start, _end in self.movements],
+        }
+
+    def _write(self, movements, detail):
+        app = self.app
+        if not (0 <= self.group_index < len(app.animation_steps)):
+            return
+        group = app.animation_steps[self.group_index]
+        app._set_action_detail(group, self.position, detail)
+        for label, start, end in movements:
+            moving = app._action_positions_moving(self.group_index, label)
+            if not moving or self.position <= min(moving):
+                app._set_group_position(self.group_index - 1, label, start)
+            if not moving or self.position >= max(moving):
+                app._set_group_position(self.group_index, label, end)
+        app._after_timeline_edit(self.group_index)
+
+    def execute(self):
+        if not (0 <= self.group_index < len(self.app.animation_steps)):
+            return
+        if self.before is None:
+            self.before = self._snapshot()
+        self._write(self.movements, {"moves": copy.deepcopy(self.movements)})
+
+    def undo(self):
+        if self.before is None:
+            return
+        app = self.app
+        group = app.animation_steps[self.group_index]
+        app._set_action_detail(group, self.position, self.before["detail"])
+        for label, previous, current in self.before["positions"]:
+            app._set_group_position(self.group_index - 1, label, previous)
+            app._set_group_position(self.group_index, label, current)
+        app._after_timeline_edit(self.group_index)
+
+    def serialize(self):
+        return {"type": "edit_movement", "group": self.group_index,
+                "position": self.position, "movements": self.movements}
+
+
+
 class Tooltip:
     """A small caption that appears under a widget on hover.
 
@@ -449,8 +686,11 @@ class DrawLineCommand(Command):
         self.app._rerecord_animation_step(self.animation_record)
 
     def record(self):
-        """An arrow belongs to the group it was drawn in, alongside the moves."""
-        self.animation_record = self.app.record_action_in_group(self.step_desc)
+        """An arrow belongs to the group it was drawn in, alongside the moves, and
+        carries the two ends it was drawn between so the timeline can show them."""
+        self.animation_record = self.app.record_action_in_group(
+            self.step_desc,
+            self.app._drawing_detail(self.x1, self.y1, self.x2, self.y2))
         self.app.tag_items_with_group(self.line_ids, self.step_desc)
 
     def undo(self):
@@ -647,6 +887,32 @@ class FloorballTacticsApp:
     # move or stretch a line.
     BEND_HANDLE_COLOR = "#f76707"
 
+    VERSION = "3.0"
+    # What a video needs, and what to install when it is missing. GIF, PNG and JPEG
+    # need none of it.
+    VIDEO_PACKAGES = ("imageio", "imageio-ffmpeg")
+    VIDEO_BACKENDS = {"imageio": "imageio.v2", "opencv": "cv2"}
+    # How long a group runs by default, worked out from what is in it. The opening
+    # group is a still to read before anything happens; a shot is quick; the other
+    # marks are drawn at a readable pace; moving players and the ball is a cut, so it
+    # takes no time at all and the board simply steps to the new arrangement.
+    OPENING_SECONDS = 2.0
+    # A held beat at the end of each group, when the box is ticked: a play where every
+    # group runs straight into the next is hard to read back.
+    STEP_BREAK_SECONDS = 0.4
+    ACTION_SECONDS = {"shot": 0.5, "pass": 1.5, "run": 1.5, "dribble": 1.5,
+                      "bend": 1.5, "line": 1.5, "box": 1.5, "rect": 1.5,
+                      "circle": 1.5, "oval": 1.5, "move": 0.0}
+    # Where Report a Bug sends. Deliberately an address that cannot exist -- .invalid
+    # is reserved for exactly this -- so a fresh copy of the application never quietly
+    # mails a stranger. The first bug report asks for the real one and keeps it in the
+    # config, and Preferences can change it afterwards.
+    BUG_REPORT_EMAIL = "bugs@floorball-studio.invalid"
+    # How much of the log a report carries, and how much is kept in memory. Enough to
+    # cover the run-up to a problem without turning a report into a haystack.
+    DEBUG_LOG_LINES = 500
+    DEBUG_REPORT_LINES = 120
+
     # Every widget asked for "Segoe UI", which only exists on Windows. Elsewhere Tk
     # silently falls back to the "fixed" bitmap font, which is why the whole UI
     # rendered in blocky terminal type. Take the first family that is actually
@@ -699,6 +965,9 @@ class FloorballTacticsApp:
         self.animation_playing = False
         self.animation_job = None
         self.anim_buttons = {}
+        self.timeline_collapsed = False
+        # The group currently being played, which is the red row while it runs.
+        self._playing_group = None
         self.step_time_var = tk.DoubleVar(value=2.0)
 
         # Text labels and pictures placed on the board (the watermark is separate: one
@@ -727,8 +996,28 @@ class FloorballTacticsApp:
         self.hidden_pitch_parts = set()
         self.selection_rect = None
         self.selection_start = None
-        # Where attached arrows sat when playback began; None means "not captured".
-        self._attached_origins = None
+        # What the application has been doing, for a bug report to carry. Kept whether
+        # or not debug mode is on -- the interesting part of a log is always the bit
+        # from before anyone thought to turn logging on.
+        self.debug_log = deque(maxlen=self.DEBUG_LOG_LINES)
+        self.debug_mode = False
+        self.debug_mode_var = tk.BooleanVar(value=False)
+        self.debug_window = None
+        self.debug_text = None
+        # Faults already put in front of the user, so a repeating one does not keep
+        # interrupting; every occurrence is still logged.
+        self._debug_shown = set()
+        self.bug_report_email = self.BUG_REPORT_EMAIL
+        # Tk swallows anything raised inside a callback: without this a button that
+        # fails simply does nothing, which is how a fault goes unnoticed for months.
+        self.root.report_callback_exception = self._debug_report_exception
+        # Timeline dragging: the rows being carried, and the grey label that follows
+        # the cursor to show what they are.
+        self._anim_drag_rows = []
+        self._anim_drag_index = None
+        self._anim_drag_action = False
+        self._drag_ghost = None
+        self._drag_ghost_label = None
         self.zoom = 1.0
         self.pan_x = 0.0
         self.pan_y = 0.0
@@ -893,6 +1182,10 @@ class FloorballTacticsApp:
                 saved_theme = cfg.get("color_theme", self.color_theme)
                 if saved_theme in self.COLOR_THEMES:
                     self.color_theme = saved_theme
+                self.debug_mode = bool(cfg.get("debug_mode", False))
+                self.debug_mode_var.set(self.debug_mode)
+                self.bug_report_email = (cfg.get("bug_report_email")
+                                         or self.BUG_REPORT_EMAIL)
         except Exception:
             pass
 
@@ -920,12 +1213,311 @@ class FloorballTacticsApp:
                 "menu_rows_mode": self.menu_rows_mode,
                 "menu_position": self.menu_position,
                 "rink_rotated": self.rink_rotated,
-                "color_theme": self.color_theme
+                "color_theme": self.color_theme,
+                "debug_mode": self.debug_mode,
+                "bug_report_email": self.bug_report_email,
             }
             with open(self.config_path, "w") as f:
                 json.dump(cfg, f, indent=2)
         except Exception as e:
             print("Failed to save config:", e)
+
+    # ----------------------
+    # Debug mode, and reporting a bug
+    # ----------------------
+    def log_event(self, kind, message):
+        """Note something the application did, for a bug report to carry.
+
+        Always recorded, never only when debug mode is on: by the time a problem is
+        worth reporting the interesting part has already happened, and a log that only
+        starts when the switch is flipped would have missed it. Debug mode decides
+        what is *shown*, not what is kept."""
+        line = f"{datetime.datetime.now():%H:%M:%S}  {kind:<9} {message}"
+        self.debug_log.append(line)
+        if self.debug_mode:
+            self._refresh_debug_window()
+        return line
+
+    def _debug_report_exception(self, kind, value, tb):
+        """Tk hands callback errors here instead of letting them out.
+
+        Without this they go to stderr, which nobody running the application from a
+        desktop icon ever sees -- a button simply does nothing and the play looks
+        haunted. Logged always, shown when debug mode is on."""
+        try:
+            detail = "".join(traceback.format_exception(kind, value, tb)).strip()
+        except Exception:
+            detail = f"{kind}: {value}"
+        name = getattr(kind, "__name__", str(kind))
+        self.log_event("ERROR", f"{name}: {value}")
+        self.debug_log.append(detail)
+        if not self.debug_mode:
+            return
+        # Once per distinct fault, not once per occurrence. A failure inside the
+        # animation happens on every frame, and a dialog twenty-five times a second
+        # would bury the application it was meant to be reporting on -- the repeats
+        # are in the log, where they can be counted without being in the way.
+        signature = (name, str(value), detail.splitlines()[-2:] and detail[-200:])
+        if signature in self._debug_shown:
+            return
+        self._debug_shown.add(signature)
+        try:
+            messagebox.showerror(
+                "Something went wrong",
+                f"{name}: {value}\n\n"
+                "Debug mode is on, so the application is showing this rather than "
+                "carrying on quietly. The whole trace is in the debug log, and "
+                "Report a Bug will take it with it.\n\n"
+                "Further errors of this kind go to the log without interrupting.")
+        except Exception:
+            # A dialog that cannot open is not worth a second error on top.
+            pass
+
+    def set_debug_mode(self, on):
+        """Turn the reporting of swallowed errors on or off, and remember it."""
+        self.debug_mode = bool(on)
+        if hasattr(self, "debug_mode_var") and self.debug_mode_var.get() != self.debug_mode:
+            self.debug_mode_var.set(self.debug_mode)
+        self.log_event("DEBUG", f"debug mode {'on' if self.debug_mode else 'off'}")
+        if self.debug_mode:
+            self.show_debug_log()
+        self._save_config()
+        return self.debug_mode
+
+    def _system_details(self):
+        """What the machine is, for a report. No file names, nothing personal."""
+        return {
+            "app": "Floorball Tactics Studio",
+            "version": self.VERSION,
+            "python": platform.python_version(),
+            "tk": str(self.root.tk.call("info", "patchlevel")),
+            "platform": platform.platform(),
+            "rink": f"{self.rink_mode}{' half' if self.half_rink else ''}",
+            "players": len({token.get("shape_id") for token in self.tokens.values()}),
+            "drawings": len(self.drawn_items),
+            "groups": len(self.animation_steps),
+        }
+
+    def _debug_log_text(self, lines=None):
+        wanted = list(self.debug_log)
+        if lines:
+            wanted = wanted[-lines:]
+        return "\n".join(wanted)
+
+    def show_debug_log(self):
+        """A window onto the log, kept up to date while the application runs."""
+        if self.debug_window is not None and self.debug_window.winfo_exists():
+            self.debug_window.lift()
+            self._refresh_debug_window()
+            return self.debug_window
+        window = tk.Toplevel(self.root)
+        window.title("Debug Log")
+        window.geometry("760x420")
+        self.debug_window = window
+
+        top = tk.Frame(window)
+        top.pack(fill=tk.X, padx=8, pady=(8, 2))
+        tk.Checkbutton(top, text="Debug mode (show errors instead of swallowing them)",
+                       variable=self.debug_mode_var,
+                       command=lambda: self.set_debug_mode(self.debug_mode_var.get())
+                       ).pack(side=tk.LEFT)
+
+        self.debug_text = tk.Text(window, wrap="none", font=("TkFixedFont", 8))
+        self.debug_text.pack(fill=tk.BOTH, expand=True, padx=8, pady=4)
+        scroll = ttk.Scrollbar(window, orient="horizontal",
+                               command=self.debug_text.xview)
+        scroll.pack(fill=tk.X, padx=8)
+        self.debug_text.config(xscrollcommand=scroll.set)
+
+        buttons = tk.Frame(window)
+        buttons.pack(fill=tk.X, padx=8, pady=8)
+        tk.Button(buttons, text="Refresh", width=self.BTN_W,
+                  command=self._refresh_debug_window).pack(side=tk.LEFT, padx=4)
+        tk.Button(buttons, text="Copy", width=self.BTN_W,
+                  command=self._copy_debug_log).pack(side=tk.LEFT, padx=4)
+        tk.Button(buttons, text="Save Log...", width=self.BTN_W,
+                  command=self.save_debug_log).pack(side=tk.LEFT, padx=4)
+        tk.Button(buttons, text="Report a Bug...", width=self.BTN_W,
+                  command=self.report_bug).pack(side=tk.LEFT, padx=4)
+        tk.Button(buttons, text="Close", width=self.BTN_W,
+                  command=self._close_debug_window).pack(side=tk.RIGHT, padx=4)
+        window.protocol("WM_DELETE_WINDOW", self._close_debug_window)
+        self._refresh_debug_window()
+        return window
+
+    def _close_debug_window(self):
+        window, self.debug_window, self.debug_text = self.debug_window, None, None
+        if window is not None:
+            try:
+                window.destroy()
+            except Exception:
+                pass
+
+    def _refresh_debug_window(self):
+        if self.debug_text is None:
+            return
+        try:
+            if not self.debug_text.winfo_exists():
+                self.debug_text = None
+                return
+            self.debug_text.delete("1.0", tk.END)
+            self.debug_text.insert("1.0", self._debug_log_text())
+            self.debug_text.see(tk.END)
+        except Exception:
+            # The window went away underneath us; nothing here is worth an error.
+            self.debug_text = None
+
+    def _copy_debug_log(self):
+        self.root.clipboard_clear()
+        self.root.clipboard_append(self._debug_log_text())
+
+    def save_debug_log(self):
+        path = filedialog.asksaveasfilename(defaultextension=".txt",
+                                            filetypes=[("Text", "*.txt")])
+        if not path:
+            return None
+        with open(path, "w") as handle:
+            handle.write(self._debug_log_text())
+        self.log_event("DEBUG", f"log saved to {os.path.basename(path)}")
+        return path
+
+    def _reports_dir(self):
+        """Where reports are written: beside the config, so it survives an update."""
+        folder = os.path.join(os.path.dirname(os.path.abspath(self.config_path)),
+                              "bug-reports")
+        os.makedirs(folder, exist_ok=True)
+        return folder
+
+    def _ask_bug_report_email(self):
+        """The address reports go to, asked for once and kept.
+
+        The application ships pointing at an address that cannot exist, so that a copy
+        of it never mails anyone by accident."""
+        current = self.bug_report_email
+        if current and not current.endswith(".invalid"):
+            return current
+        answer = self._ask_for_text(
+            initial="" if current.endswith(".invalid") else current,
+            title="Where should bug reports go?",
+            prompt="Email address for bug reports:", accept_text="Use this")
+        if not answer or "@" not in answer:
+            return None
+        self.bug_report_email = answer.strip()
+        self._save_config()
+        return self.bug_report_email
+
+    def write_bug_report(self, description, include_play=True, include_log=True):
+        """The report as a file, and the summary that goes in the mail body."""
+        stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        path = os.path.join(self._reports_dir(), f"bug-report-{stamp}.json")
+        report = {
+            "reported_at": datetime.datetime.now().isoformat(timespec="seconds"),
+            "description": description,
+            "system": self._system_details(),
+        }
+        if include_log:
+            report["log"] = list(self.debug_log)[-self.DEBUG_REPORT_LINES:]
+        if include_play:
+            # The play is what makes an animation bug reproducible: the same board,
+            # the same groups, the same arrows.
+            report["play"] = {
+                "board": self._board_snapshot(),
+                "drawings": self._drawings_snapshot(),
+                "animation": self._animation_snapshot(),
+            }
+        with open(path, "w") as handle:
+            json.dump(report, handle, indent=2, default=str)
+        self.log_event("REPORT", f"bug report written to {os.path.basename(path)}")
+        return path, report
+
+    def _bug_report_mailto(self, address, description, path, report):
+        details = "\n".join(f"  {key}: {value}"
+                            for key, value in report["system"].items())
+        body = (f"{description}\n\n"
+                f"-- what this was running on --\n{details}\n\n"
+                f"The full report, including the play itself, is attached as:\n"
+                f"{path}\n"
+                f"(Please attach that file -- a mail link cannot attach it itself.)\n")
+        query = urllib.parse.urlencode(
+            {"subject": f"Floorball Studio bug report ({report['system']['version']})",
+             "body": body}, quote_via=urllib.parse.quote)
+        return f"mailto:{address}?{query}"
+
+    def report_bug(self):
+        """Describe what went wrong, and send it to the address reports go to.
+
+        The mail goes out through whatever mail program is already set up rather than
+        the application carrying a mailbox password around, and the report itself is
+        written to a file first, so nothing is lost if the mail never gets sent."""
+        window = tk.Toplevel(self.root)
+        window.title("Report a Bug")
+        window.transient(self.root)
+        tk.Label(window, text="What went wrong?", font=(self.UI_FONT, 9, "bold")).pack(
+            anchor="w", padx=10, pady=(10, 2))
+        tk.Label(window, text="What you did, what you expected, and what happened "
+                              "instead.", font=(self.UI_FONT, 8), fg=self.C_MUTED,
+                 justify=tk.LEFT, wraplength=420).pack(anchor="w", padx=10)
+        entry = tk.Text(window, width=56, height=8, wrap="word")
+        entry.pack(fill=tk.BOTH, expand=True, padx=10, pady=6)
+        entry.focus_set()
+
+        play_var = tk.BooleanVar(value=True)
+        log_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(window, text="Include the play on the board (makes it "
+                                    "reproducible)", variable=play_var,
+                       anchor="w").pack(fill=tk.X, padx=10)
+        tk.Checkbutton(window, text="Include the recent action log", variable=log_var,
+                       anchor="w").pack(fill=tk.X, padx=10)
+
+        outcome = {"path": None}
+
+        def send():
+            description = entry.get("1.0", tk.END).strip()
+            if not description:
+                messagebox.showwarning("Nothing to report",
+                                       "Say what went wrong first.")
+                return
+            address = self._ask_bug_report_email()
+            path, report = self.write_bug_report(description, play_var.get(),
+                                                 log_var.get())
+            outcome["path"] = path
+            window.destroy()
+            if not address:
+                messagebox.showinfo(
+                    "Report saved",
+                    f"No address is set, so nothing was sent.\n\nThe report is at:\n"
+                    f"{path}")
+                return
+            try:
+                webbrowser.open(self._bug_report_mailto(address, description, path,
+                                                        report))
+            except Exception as error:
+                messagebox.showinfo(
+                    "Report saved",
+                    f"The report is at:\n{path}\n\nA mail program could not be "
+                    f"opened ({error}), so please send it along yourself.")
+                return
+            messagebox.showinfo(
+                "Report ready",
+                f"Your mail program should be opening with the report in it.\n\n"
+                f"Please attach this file before sending -- it holds the play:\n{path}")
+
+        def save_only():
+            description = entry.get("1.0", tk.END).strip() or "(no description)"
+            outcome["path"], _ = self.write_bug_report(description, play_var.get(),
+                                                       log_var.get())
+            window.destroy()
+            messagebox.showinfo("Report saved", f"Written to:\n{outcome['path']}")
+
+        buttons = tk.Frame(window)
+        buttons.pack(fill=tk.X, padx=10, pady=10)
+        tk.Button(buttons, text="Send", command=send, width=self.BTN_W).pack(
+            side=tk.LEFT, padx=4)
+        tk.Button(buttons, text="Save Only", command=save_only,
+                  width=self.BTN_W).pack(side=tk.LEFT, padx=4)
+        tk.Button(buttons, text="Cancel", command=window.destroy,
+                  width=self.BTN_W).pack(side=tk.RIGHT, padx=4)
+        return window
 
     # ----------------------
     # Commands / Undo helpers
@@ -938,14 +1530,13 @@ class FloorballTacticsApp:
         recorder = getattr(cmd, "record", None)
         if callable(recorder):
             recorder()
+        self.log_event("ACTION", f"{getattr(cmd, 'step_desc', None) or type(cmd).__name__}"
+                                 f" (group {max(0, len(self.animation_steps) - 1)})")
         # Which group this instruction belongs to. Saving uses it to tell a superseded
         # instruction from one that merely looks similar but happens later in the play.
         cmd.animation_group = max(0, len(self.animation_steps) - 1)
         self.undo_stack.append(cmd)
         self.redo_stack.clear()
-        # The board has changed under it, so whatever playback remembered about the
-        # arrows is stale.
-        self._attached_origins = None
         self._sync_full_coords()
         self._save_config()
 
@@ -1282,8 +1873,9 @@ class FloorballTacticsApp:
     # live PIL objects behind a picture.
     ITEM_META_SKIP = ("full_coords", "photo", "original", "image")
 
-    def _drawings_snapshot(self):
-        """Every mark on the board, in rink metres.
+    def _drawings_snapshot(self, only=None):
+        """Every mark on the board, in rink metres -- or just the ones in `only`, which
+        is how a deletion keeps hold of what it took away so it can be undone.
 
         The command log alone cannot reproduce a play. It records the pixels a line
         was drawn between, which mean nothing in another window size, on another
@@ -1296,6 +1888,8 @@ class FloorballTacticsApp:
             return []
         items = []
         for cid, meta in self.drawn_items.items():
+            if only is not None and cid not in only:
+                continue
             try:
                 kind = self.canvas.type(cid)
                 coords = self.canvas.coords(cid)
@@ -1379,54 +1973,66 @@ class FloorballTacticsApp:
 
         restored = []
         for entry in entries:
-            kind = entry.get("kind")
-            points = [self._state_m_to_px(mx, my, state)
-                      for mx, my in entry.get("points_m") or ()]
-            flat = [value for point in points for value in point]
-            style = dict(entry.get("style") or {})
-            meta = dict(entry.get("meta") or {})
-            cid = None
-            try:
-                if kind == "image":
-                    cid = self._restore_board_image(entry, points, state)
-                elif kind == "text":
-                    text = style.pop("text", meta.get("text", ""))
-                    cid = self.canvas.create_text(*flat[:2], text=text,
-                                                  tags=("sign",), **style)
-                elif kind == "line" and len(flat) >= 4:
-                    cid = self.canvas.create_line(*flat, tags=("tactic_line",), **style)
-                elif kind == "polygon" and len(flat) >= 6:
-                    cid = self.canvas.create_polygon(*flat, tags=("sign",), **style)
-                elif kind in ("oval", "rectangle", "arc") and len(flat) >= 4:
-                    maker = {"oval": self.canvas.create_oval,
-                             "rectangle": self.canvas.create_rectangle,
-                             "arc": self.canvas.create_arc}[kind]
-                    cid = maker(*flat[:4], tags=("sign",), **style)
-            except Exception:
-                cid = None
-            if cid is None:
-                continue
-            data = entry.get("data")
-            if isinstance(data, dict):
-                data = dict(data)
-                for a, b in (("x1", "y1"), ("x2", "y2")):
-                    if a + "_m" in data:
-                        px, py = self._state_m_to_px(data.pop(a + "_m"),
-                                                     data.pop(b + "_m"), state)
-                        data[a], data[b] = px, py
-                if "cx_m" in data:
-                    px, py = self._state_m_to_px(data.pop("cx_m"), data.pop("cy_m"), state)
-                    data.setdefault("extra", {}).update({"cx": px, "cy": py})
-                meta["data"] = data
-            if meta.get("group"):
-                try:
-                    self.canvas.addtag_withtag(meta["group"], cid)
-                except Exception:
-                    pass
-            self._register_drawn_item(cid, meta)
-            self.drawn_items[cid]["full_coords"] = list(self.canvas.coords(cid))
-            restored.append(cid)
+            cid = self._rebuild_drawing(entry, state)
+            if cid is not None:
+                restored.append(cid)
         return restored
+
+    def _rebuild_drawing(self, entry, state=None):
+        """Put one saved mark back on the board, and return its id.
+
+        Split out of `_restore_drawings` so that undoing a deletion can bring back the
+        few things it removed without clearing the board and rebuilding all of it."""
+        state = state or self._pitch_state()
+        if not state.get("scale"):
+            return None
+        kind = entry.get("kind")
+        points = [self._state_m_to_px(mx, my, state)
+                  for mx, my in entry.get("points_m") or ()]
+        flat = [value for point in points for value in point]
+        style = dict(entry.get("style") or {})
+        meta = dict(entry.get("meta") or {})
+        cid = None
+        try:
+            if kind == "image":
+                cid = self._restore_board_image(entry, points, state)
+            elif kind == "text":
+                text = style.pop("text", meta.get("text", ""))
+                cid = self.canvas.create_text(*flat[:2], text=text,
+                                              tags=("sign",), **style)
+            elif kind == "line" and len(flat) >= 4:
+                cid = self.canvas.create_line(*flat, tags=("tactic_line",), **style)
+            elif kind == "polygon" and len(flat) >= 6:
+                cid = self.canvas.create_polygon(*flat, tags=("sign",), **style)
+            elif kind in ("oval", "rectangle", "arc") and len(flat) >= 4:
+                maker = {"oval": self.canvas.create_oval,
+                         "rectangle": self.canvas.create_rectangle,
+                         "arc": self.canvas.create_arc}[kind]
+                cid = maker(*flat[:4], tags=("sign",), **style)
+        except Exception:
+            cid = None
+        if cid is None:
+            return None
+        data = entry.get("data")
+        if isinstance(data, dict):
+            data = dict(data)
+            for a, b in (("x1", "y1"), ("x2", "y2")):
+                if a + "_m" in data:
+                    px, py = self._state_m_to_px(data.pop(a + "_m"),
+                                                 data.pop(b + "_m"), state)
+                    data[a], data[b] = px, py
+            if "cx_m" in data:
+                px, py = self._state_m_to_px(data.pop("cx_m"), data.pop("cy_m"), state)
+                data.setdefault("extra", {}).update({"cx": px, "cy": py})
+            meta["data"] = data
+        if meta.get("group"):
+            try:
+                self.canvas.addtag_withtag(meta["group"], cid)
+            except Exception:
+                pass
+        self._register_drawn_item(cid, meta)
+        self.drawn_items[cid]["full_coords"] = list(self.canvas.coords(cid))
+        return cid
 
     def _restore_board_image(self, entry, points, state):
         payload = entry.get("image") or {}
@@ -1461,7 +2067,11 @@ class FloorballTacticsApp:
                 "duration": round(duration, 3),
                 "ends_at": round(elapsed + (duration if index else 0.0), 3),
                 "actions": list(step.get("actions") or []),
-                "board": step.get("board"),
+                "action_details": list(step.get("action_details") or []),
+                # Without the watermark: every group carries a board, and embedding the
+                # image in each of them wrote it into the file a dozen times over.
+                "board": {key: value for key, value in (step.get("board") or {}).items()
+                          if key != "watermark"} or None,
             })
             if index:
                 elapsed += duration
@@ -1485,6 +2095,7 @@ class FloorballTacticsApp:
                 "closed": bool(entry.get("closed", True)),
                 "duration": max(0.0, float(entry.get("duration", 1.0))),
                 "actions": list(entry.get("actions") or []),
+                "action_details": list(entry.get("action_details") or []),
                 "board": entry.get("board"),
             })
         self.animation_playhead = max(0, min(int(payload.get("playhead", 0)),
@@ -1520,6 +2131,45 @@ class FloorballTacticsApp:
                                              if 0 <= i < len(restored)]
             token["attached_lines_end"] = [restored[i] for i in entry.get("end", [])
                                            if 0 <= i < len(restored)]
+
+    def _report_damaged_marks(self):
+        """Say so when a file holds marks that cannot be drawn on.
+
+        A line with both ends in the same place has no length to grow along, so it can
+        only appear whole however long its group runs -- which reads as an arrow that
+        "does not play". Older versions could write one: playback wrote its part-drawn
+        geometry back into the drawing, so saving while an animation was part-way
+        through recorded the arrow as collapsed. The geometry is gone by then and
+        cannot be worked out again, so the only honest thing is to name them."""
+        damaged = []
+        for cid, meta in self.drawn_items.items():
+            if meta.get("anim_group") is None:
+                continue
+            try:
+                if self.canvas.type(cid) != "line":
+                    continue
+                coords = meta.get("full_coords") or self.canvas.coords(cid)
+            except Exception:
+                continue
+            if not coords or len(coords) < 4:
+                continue
+            length = sum(math.hypot(coords[i + 2] - coords[i],
+                                    coords[i + 3] - coords[i + 1])
+                         for i in range(0, len(coords) - 3, 2))
+            if length < 1.0:
+                damaged.append((meta.get("anim_group"), meta.get("anim_action")))
+        if not damaged:
+            return []
+        listed = ", ".join(f"{action or 'a mark'} in group {group}"
+                           for group, action in sorted(damaged, key=lambda d: d[0]))
+        self.log_event("LOAD", f"{len(damaged)} mark(s) have no length: {listed}")
+        messagebox.showwarning(
+            "Marks that cannot be drawn on",
+            f"{len(damaged)} mark(s) in this file have both ends in the same place, "
+            f"so they appear all at once instead of being drawn on:\n\n{listed}\n\n"
+            "They were saved that way, and the shape they had cannot be recovered -- "
+            "delete and redraw them to fix it.")
+        return damaged
 
     def _restore_board(self, board):
         players = [p for p in (board.get("players") or []) if p.get("label")]
@@ -1580,13 +2230,18 @@ class FloorballTacticsApp:
     IMAGE_DEFAULT_W_M = 8.0
     IMAGE_MIN_PX = 12
 
-    def _ask_for_text(self, initial=""):
-        """A small modal in the app's own style, rather than Tk's stock prompt."""
+    def _ask_for_text(self, initial="", title="Text",
+                      prompt="Text to place on the board:", accept_text="Place"):
+        """A small modal in the app's own style, rather than Tk's stock prompt.
+
+        The wording is a parameter because this asks for more than board text now --
+        the address bug reports go to comes through here as well -- while the defaults
+        keep it the board-text prompt it started as."""
         window = tk.Toplevel(self.root)
-        window.title("Text")
+        window.title(title)
         window.transient(self.root)
         window.configure(bg=self.C_PANEL)
-        tk.Label(window, text="Text to place on the board:", bg=self.C_PANEL,
+        tk.Label(window, text=prompt, bg=self.C_PANEL,
                  fg=self.C_TEXT, font=(self.UI_FONT, 9)).pack(padx=14, pady=(12, 6))
         value = tk.StringVar(value=initial)
         entry = tk.Entry(window, textvariable=value, font=(self.UI_FONT, 10), width=34,
@@ -1606,7 +2261,7 @@ class FloorballTacticsApp:
                "fg": self.C_TEXT, "bd": 0, "highlightthickness": 1,
                "highlightbackground": self.C_BORDER, "padx": 10, "pady": 3,
                "cursor": "hand2"}
-        tk.Button(buttons, text="Place", command=accept, **cfg).pack(side=tk.RIGHT, padx=3)
+        tk.Button(buttons, text=accept_text, command=accept, **cfg).pack(side=tk.RIGHT, padx=3)
         tk.Button(buttons, text="Cancel", command=window.destroy, **cfg).pack(side=tk.RIGHT)
         entry.bind("<Return>", accept)
         window.bind("<Escape>", lambda _e: window.destroy())
@@ -1809,6 +2464,7 @@ class FloorballTacticsApp:
                 "positions.\n\nIt cannot be undone. Continue?"):
             return
 
+        self.log_event("RESET", "board cleared")
         self.stop_animation()
         self.animation_steps = []
         self.animation_playhead = 0
@@ -1865,24 +2521,120 @@ class FloorballTacticsApp:
 
         The very first Add Step records two: the board as it stands becomes step 0, the
         opening slide, so there is always something to move *from*."""
-        duration = max(0.0, float(self.step_time_var.get()))
-        snapshot = self._board_snapshot()
+        snapshot = self._keyframe_board(moved=set())
         if not self.animation_steps:
-            self.animation_steps.append({"duration": duration, "board": snapshot,
+            self.animation_steps.append({"duration": self.OPENING_SECONDS,
+                                         "board": snapshot,
                                          "name": "Start", "actions": [],
                                          "named": False, "closed": True})
             self.animation_playhead = 0
             self._refresh_animation_list()
+            self.select_group_row(0)
             return
         # Closing the current group is the point of the button: whatever is recorded
         # next starts a new step instead of joining this one.
         if self.animation_steps:
             self.animation_steps[-1]["closed"] = True
-        self.animation_steps.append({"duration": duration, "board": snapshot,
-                                     "name": f"Step {len(self.animation_steps)}",
-                                     "actions": [], "named": False})
-        self.animation_playhead = len(self.animation_steps) - 1
+        # A group picked in the timeline says where the new one goes: straight after
+        # it, which is how a group gets inserted into the middle of a play rather than
+        # only ever being added to the end of it.
+        picked = self._selected_group()
+        at = picked + 1 if picked is not None else len(self.animation_steps)
+        if picked is not None:
+            self.animation_steps[picked]["closed"] = True
+            # The board the new group starts from is the one the group before it ends
+            # at, not the end of the whole play.
+            snapshot = copy.deepcopy(self.animation_steps[picked].get("board")
+                                     or snapshot)
+        self.animation_steps.insert(at, {"duration": 0.0, "board": snapshot,
+                                         "name": f"Step {at}",
+                                         "actions": [], "named": False})
+        # Everything after the insertion point has shifted along, and every drawing
+        # that belongs to one of those groups has to shift with it.
+        for meta in self.drawn_items.values():
+            for key in ("anim_group", "anim_remove_group"):
+                value = meta.get(key)
+                if value is not None and value >= at:
+                    meta[key] = value + 1
+        self._renumber_animation_steps()
+        self.animation_playhead = at
         self._refresh_animation_list()
+        # Picked as well as pointed at: the group just made is the one being worked
+        # on, so what is drawn next belongs to it without having to click it first.
+        self.select_group_row(at)
+
+    def toggle_timeline_detail(self, collapse=None):
+        """Fold every group shut, or open them all again.
+
+        A group lists what happens inside it, which is what you want while building
+        one and in the way when you are looking at the shape of a whole play. The
+        button says which way it will go next."""
+        tree = getattr(self, "anim_tree", None)
+        if tree is None:
+            return False
+        rows = tree.get_children("")
+        if collapse is None:
+            collapse = any(tree.item(row, "open") for row in rows)
+        for row in rows:
+            tree.item(row, open=not collapse)
+        self.timeline_collapsed = bool(collapse)
+        button = (getattr(self, "anim_buttons", None) or {}).get("Collapse")
+        if button is not None:
+            try:
+                button.config(text="Expand" if collapse else "Collapse")
+            except Exception:
+                pass
+        return True
+
+    def _break_between_steps(self):
+        """Whether a beat is held at the end of each group."""
+        variable = getattr(self, "step_break_var", None)
+        return bool(variable.get()) if variable is not None else False
+
+    def show_play_end(self):
+        """The board at rest: the play as it finishes, with every mark on it."""
+        if not self.animation_steps:
+            return False
+        last = len(self.animation_steps) - 1
+        self._apply_animation_frame(self.animation_steps[max(last - 1, 0)],
+                                    self.animation_steps[last], 1.0)
+        self.show_all_drawn_items()
+        return True
+
+    def preview_group(self, index):
+        """Show the board as it stands once a group has finished.
+
+        Players where that group leaves them, and only the marks made up to and
+        including it -- which is the frame the animation would be showing at that
+        point, held still."""
+        if not (0 <= index < len(self.animation_steps)):
+            return False
+        if self.animation_job is not None:
+            return False        # something is playing; leave it alone
+        self._apply_animation_frame(self.animation_steps[max(index - 1, 0)],
+                                    self.animation_steps[index], 1.0)
+        return True
+
+    def toggle_group_preview(self):
+        """The checkbox: follow the timeline with the board, or go back to the play."""
+        if self.preview_var.get():
+            picked = self._selected_group()
+            return self.preview_group(picked if picked is not None
+                                      else self.animation_playhead)
+        return self.show_play_end()
+
+    def select_group_row(self, index):
+        """Pick a group in the timeline, as though it had been clicked."""
+        tree = getattr(self, "anim_tree", None)
+        if tree is None or not (0 <= index < len(self.animation_steps)):
+            return False
+        row = f"g{index}"
+        if not tree.exists(row):
+            return False
+        tree.selection_set(row)
+        tree.see(row)
+        self.animation_playhead = index
+        return True
 
     def delete_animation_selection(self):
         """Delete whatever the timeline has picked.
@@ -1895,11 +2647,12 @@ class FloorballTacticsApp:
         selection = tree.selection() if tree is not None else ()
         item = selection[0] if selection else None
         if item and tree.parent(item):
-            group_index = self._group_index_for(item)
-            try:
-                position = int(item.split("a")[-1])
-            except ValueError:
-                position = None
+            group_index, kind, position = self._row_parts(item)
+            if kind == "m":
+                # A movement line is the group's snapshot being read back, not an
+                # instruction of its own: there is nothing there to delete, and falling
+                # through would have taken the whole group with it.
+                return None
             if group_index is not None and position is not None:
                 return self.delete_animation_action(group_index, position)
         return self.delete_animation_step()
@@ -1909,50 +2662,31 @@ class FloorballTacticsApp:
 
         A move leaves nothing behind to delete -- where the players ended up is the
         group's own snapshot -- but an arrow, a sign or a label is a thing on the rink,
-        and a timeline that still listed it after it was gone would be lying."""
-        if not (0 <= group_index < len(self.animation_steps)):
-            return
-        group = self.animation_steps[group_index]
-        actions = group.get("actions") or []
-        if not (0 <= position < len(actions)):
-            return
-        description = actions.pop(position)
-        if description.startswith("Remove "):
-            # The row *is* the removal, so taking the row out puts the mark back into
-            # the play rather than deleting anything.
-            name = description[len("Remove "):]
-            for cid, meta in list(self.drawn_items.items()):
-                if (meta.get("anim_remove_group") == group_index
-                        and self._drawn_label(cid) == name):
-                    meta.pop("anim_remove_group", None)
-            self.show_all_drawn_items()
-            self._refresh_animation_list()
-            return
-        for cid, meta in list(self.drawn_items.items()):
-            if (meta.get("anim_group") == group_index
-                    and meta.get("anim_action") == description):
-                try:
-                    self.canvas.delete(cid)
-                except Exception:
-                    pass
-                self.drawn_items.pop(cid, None)
-                self.board_images.pop(cid, None)
-        self._refresh_animation_list()
+        and a timeline that still listed it after it was gone would be lying.
 
-    def delete_animation_step(self):
+        Pushed onto the undo stack rather than done on the spot, so that Ctrl+Z brings
+        it back like every other change to the board."""
+        if not (0 <= group_index < len(self.animation_steps)):
+            return None
+        actions = self.animation_steps[group_index].get("actions") or []
+        if not (0 <= position < len(actions)):
+            return None
+        command = DeleteAnimationActionCommand(self, group_index, position)
+        self.push_command(command, execute=True)
+        return command
+
+    def delete_animation_step(self, index=None):
+        """Delete a whole group, and everything the timeline says about it."""
         if not self.animation_steps:
             messagebox.showwarning("No groups", "There are no groups to delete.")
-            return
-        index = self.animation_playhead
-        if 0 <= index < len(self.animation_steps):
-            self.animation_steps.pop(index)
-        # _renumber_animation_steps, not a blanket rename: a step called after the
-        # action that made it ("Move LD, RW") must keep saying so. Renaming every
-        # survivor to "Step n" made deleting one look like it had wiped the others.
-        self._renumber_animation_steps()
-        self.animation_playhead = max(0, min(self.animation_playhead,
-                                             len(self.animation_steps) - 1))
-        self._refresh_animation_list()
+            return None
+        if index is None:
+            index = self.animation_playhead
+        if not (0 <= index < len(self.animation_steps)):
+            return None
+        command = DeleteAnimationStepCommand(self, index)
+        self.push_command(command, execute=True)
+        return command
 
     def _display_label(self, label):
         """What the rink shows for this player: its tactical role once a formation has
@@ -1985,7 +2719,8 @@ class FloorballTacticsApp:
         to travel from."""
         if not label_moves:
             return None
-        after = self._board_snapshot()
+        after = self._keyframe_board(moved=set(label_moves))
+        detail = self._movement_detail(label_moves)
         record = {"created": [], "merged": None}
 
         if not self.animation_steps:
@@ -1995,6 +2730,7 @@ class FloorballTacticsApp:
             start = {"duration": max(0.1, float(self.step_time_var.get())),
                      "board": after, "name": "Group 0",
                      "actions": [name] if name else [],
+                     "action_details": [detail] if name else [],
                      "named": False, "closed": False}
             self.animation_steps.append(start)
             record["created"].append(start)
@@ -2019,6 +2755,8 @@ class FloorballTacticsApp:
 
         if name:
             current.setdefault("actions", []).append(name)
+            self._set_action_detail(current, len(current["actions"]) - 1, detail)
+            self._retime_group(self.animation_steps.index(current))
             # Group 0 is the stage the animation begins at, so arranging the board
             # there is setup rather than choreography: it keeps its plain name, while
             # still listing what was done inside it.
@@ -2032,12 +2770,18 @@ class FloorballTacticsApp:
         self._renumber_animation_steps()
         self.animation_playhead = len(self.animation_steps) - 1
         self._refresh_animation_list()
+        # A move always joins the group at the end of the play, so that is now the
+        # group being worked on. Without this the timeline kept whatever was picked
+        # before and the next arrow went there instead -- the moves at one end of the
+        # play and the arrows at the other.
+        self.select_group_row(self.animation_playhead)
         return record
 
     @staticmethod
     def _step_state(step):
         return {"board": step.get("board"),
                 "actions": list(step.get("actions") or []),
+                "action_details": list(step.get("action_details") or []),
                 "name": step.get("name"),
                 "named": step.get("named", False)}
 
@@ -2084,10 +2828,30 @@ class FloorballTacticsApp:
         self.animation_playhead = max(0, len(self.animation_steps) - 1)
         self._refresh_animation_list()
 
+    def _selected_group(self):
+        """The group the timeline has picked, or None when nothing is picked.
+
+        Deliberately the selection rather than the red playhead: the playhead moves on
+        its own as the animation runs and sits back on group 0 after a Stop, so
+        working from it would have quietly dropped new arrows into the opening group.
+        A selection is something somebody did on purpose."""
+        tree = getattr(self, "anim_tree", None)
+        selection = tree.selection() if tree is not None else ()
+        if not selection:
+            return None
+        index = self._group_index_for(selection[0])
+        return index if index is not None and 0 <= index < len(self.animation_steps) else None
+
+    def _group_for_new_work(self):
+        """Which group a new drawing joins: the one picked in the timeline, and
+        otherwise the one being built at the end of the play."""
+        picked = self._selected_group()
+        return picked if picked is not None else max(0, len(self.animation_steps) - 1)
+
     def tag_items_with_group(self, ids, description=None):
         """Remember which group a drawing belongs to, so playback can bring it in with
         that group instead of having it sit on the rink from the first frame."""
-        index = max(0, len(self.animation_steps) - 1)
+        index = self._group_for_new_work()
         for cid in ids or ():
             meta = self.drawn_items.get(cid)
             if meta is None:
@@ -2098,24 +2862,45 @@ class FloorballTacticsApp:
             if coords:
                 meta["full_coords"] = list(coords)
 
-    def record_action_in_group(self, description):
+    def record_action_in_group(self, description, detail=None):
         """Put a non-movement action -- an arrow, a sign, a label -- into the group
         being built, so the timeline shows everything that makes up a group and not
-        only the players that moved."""
+        only the players that moved. `detail` is what the action did in metres, which
+        the timeline shows on the action's own line."""
         if not description:
             return None
         record = {"created": [], "merged": None}
+        picked = self._selected_group()
+        if picked is not None:
+            # A group is picked in the timeline, so that is where this belongs --
+            # no new group, and the group at the end of the play is left alone. This
+            # is how a mark gets added to a group that was finished a while ago.
+            current = self.animation_steps[picked]
+            record["merged"] = {"step": current, "before": self._step_state(current)}
+            current.setdefault("actions", []).append(description)
+            self._set_action_detail(current, len(current["actions"]) - 1, detail)
+            self._retime_group(picked)
+            if not current.get("custom_name") and picked > 0:
+                current["name"] = self._step_name_from_actions(current["actions"])
+                current["named"] = True
+            record["merged"]["after"] = self._step_state(current)
+            self._renumber_animation_steps()
+            self.animation_playhead = picked
+            self._refresh_animation_list()
+            return record
         if not self.animation_steps:
             group = {"duration": max(0.0, float(self.step_time_var.get())),
-                     "board": self._board_snapshot(), "name": "Group 0",
-                     "actions": [description], "named": False, "closed": False}
+                     "board": self._keyframe_board(moved=set()),
+                     "name": "Group 0",
+                     "actions": [description], "action_details": [detail],
+                     "named": False, "closed": False}
             self.animation_steps.append(group)
             record["created"].append(group)
         else:
             current = self.animation_steps[-1]
             if current.get("closed"):
                 current = {"duration": max(0.0, float(self.step_time_var.get())),
-                           "board": self._board_snapshot(),
+                           "board": self._keyframe_board(moved=set()),
                            "name": f"Group {len(self.animation_steps)}",
                            "actions": [], "named": False, "closed": False}
                 self.animation_steps.append(current)
@@ -2123,6 +2908,8 @@ class FloorballTacticsApp:
             else:
                 record["merged"] = {"step": current, "before": self._step_state(current)}
             current.setdefault("actions", []).append(description)
+            self._set_action_detail(current, len(current["actions"]) - 1, detail)
+            self._retime_group(self.animation_steps.index(current))
             if not current.get("custom_name") and self.animation_steps.index(current) > 0:
                 current["name"] = self._step_name_from_actions(current["actions"])
                 current["named"] = True
@@ -2131,7 +2918,314 @@ class FloorballTacticsApp:
         self._renumber_animation_steps()
         self.animation_playhead = len(self.animation_steps) - 1
         self._refresh_animation_list()
+        if record["created"]:
+            # A new group had to be opened for this, so that is the one being worked on.
+            self.select_group_row(self.animation_playhead)
         return record
+
+    # ------------------------------------------------------------------
+    # What each line of the timeline did, in metres
+    # ------------------------------------------------------------------
+    def _action_details(self, group):
+        """The coordinates recorded against each action in a group.
+
+        Held alongside the actions rather than inside them: an action is a string
+        everywhere else in the application -- it names a group, it is compared when a
+        drawing is deleted, it is carried between groups -- and threading a dictionary
+        through all of that would have touched every one of those places. The list is
+        padded to the actions it belongs to on the way out, so the two can never fall
+        far enough out of step to matter: a missing entry shows no coordinates."""
+        actions = group.get("actions") or []
+        details = group.setdefault("action_details", [])
+        while len(details) < len(actions):
+            details.append(None)
+        del details[len(actions):]
+        return details
+
+    def _set_action_detail(self, group, position, detail):
+        details = self._action_details(group)
+        if 0 <= position < len(details):
+            details[position] = detail
+
+    def _movement_detail(self, label_moves):
+        """Where each player in a move came from and went to, in metres.
+
+        Worked out here, as the move is recorded, because the group snapshots cannot
+        say: they hold one position per player per group, so two moves of the same
+        player in one group would both report the group's own start and end."""
+        state = self._pitch_state()
+        if not state.get("scale"):
+            return None
+        moves = []
+        for label, (dx, dy) in (label_moves or {}).items():
+            sid = self._get_sid_by_label(label)
+            token = self.tokens.get(sid) if sid else None
+            centre = self._token_centre_px(token) if token else None
+            if not centre:
+                continue
+            # The move has already happened, so the token is standing on the end of it.
+            end = self._state_px_to_m(centre[0], centre[1], state)
+            travelled = self._px_delta_to_m(dx, dy)
+            start = (end[0] - travelled[0], end[1] - travelled[1])
+            moves.append([label, [round(start[0], 3), round(start[1], 3)],
+                          [round(end[0], 3), round(end[1], 3)]])
+        moves.sort(key=lambda move: self._display_label(move[0]))
+        return {"moves": moves} if moves else None
+
+    def _drawing_detail(self, x1, y1, x2, y2):
+        """Where a mark was drawn from and to, in metres."""
+        state = self._pitch_state()
+        if not state.get("scale"):
+            return None
+        start = self._state_px_to_m(x1, y1, state)
+        end = self._state_px_to_m(x2, y2, state)
+        return {"points": [[round(start[0], 3), round(start[1], 3)],
+                           [round(end[0], 3), round(end[1], 3)]]}
+
+    @staticmethod
+    def _format_detail(detail):
+        """The coordinates as they read in the timeline, on the action's own line."""
+        if not isinstance(detail, dict):
+            return ""
+        moves = detail.get("moves")
+        if moves:
+            return "   " + "   ".join(
+                f"{label} {start[0]:.1f},{start[1]:.1f}→{end[0]:.1f},{end[1]:.1f}"
+                for label, start, end in moves)
+        points = detail.get("points")
+        if points and len(points) >= 2:
+            return (f"   {points[0][0]:.1f},{points[0][1]:.1f}"
+                    f"→{points[-1][0]:.1f},{points[-1][1]:.1f}")
+        return ""
+
+    def _detail_for_display(self, index, position):
+        """What to put after an action, naming the players by what the board calls
+        them. Falls back to the group snapshots for a play saved before actions
+        started carrying their own coordinates."""
+        if not (0 <= index < len(self.animation_steps)):
+            return ""
+        group = self.animation_steps[index]
+        details = self._action_details(group)
+        recorded = details[position] if 0 <= position < len(details) else None
+        # The arrow itself first: it is a live object, so if it has been dragged or
+        # carried along by a player since it was drawn, the board is right and the
+        # note made at the time is stale. It also gives coordinates to every mark in a
+        # play saved before actions started carrying their own.
+        detail = (self._detail_from_board(index, position) or recorded
+                  or self._detail_from_snapshots(index, position))
+        if not isinstance(detail, dict) or not detail.get("moves"):
+            return self._format_detail(detail)
+        shown = {"moves": [[self._display_label(label), start, end]
+                           for label, start, end in detail["moves"]]}
+        return self._format_detail(shown)
+
+    def _detail_from_board(self, index, position):
+        """An arrow's two ends, read off the arrow on the board, in metres.
+
+        Every drawing tool -- pass, shot, run, dribble, line, bend -- is a mark with a
+        start and an end, so every one of them can say where it goes."""
+        actions = self.animation_steps[index].get("actions") or []
+        if not (0 <= position < len(actions)):
+            return None
+        description = actions[position]
+        state = self._pitch_state()
+        if not state.get("scale"):
+            return None
+        best, span = None, -1.0
+        for cid, meta in self.drawn_items.items():
+            if (meta.get("anim_group") != index
+                    or meta.get("anim_action") != description):
+                continue
+            geometry = meta.get("full_coords") or self.canvas.coords(cid)
+            if not geometry or len(geometry) < 4:
+                continue
+            # The longest piece: an arrow is a shaft plus a head, and the shaft is the
+            # one that says where it runs.
+            length = math.hypot(geometry[-2] - geometry[0], geometry[-1] - geometry[1])
+            if length > span:
+                best, span = list(geometry), length
+        if not best:
+            return None
+        start = self._state_px_to_m(best[0], best[1], state)
+        end = self._state_px_to_m(best[-2], best[-1], state)
+        return {"points": [[round(start[0], 3), round(start[1], 3)],
+                           [round(end[0], 3), round(end[1], 3)]]}
+
+    def _detail_from_snapshots(self, index, position):
+        """Coordinates worked back out of the group snapshots.
+
+        For a play that was saved before the actions carried their own, and for a
+        group whose one action is the move between two snapshots."""
+        actions = self.animation_steps[index].get("actions") or []
+        if not (0 <= position < len(actions)):
+            return None
+        if sum(1 for action in actions if action.startswith("Move ")) != 1:
+            return None
+        if not actions[position].startswith("Move "):
+            return None
+        moves = self._group_movements(index)
+        return {"moves": [[label, list(start), list(end)]
+                          for label, start, end in moves]} if moves else None
+
+    def _action_positions_moving(self, group_index, label):
+        """Which actions in a group move this player, in the order they are listed."""
+        if not (0 <= group_index < len(self.animation_steps)):
+            return []
+        details = self._action_details(self.animation_steps[group_index])
+        found = []
+        for position, detail in enumerate(details):
+            if not isinstance(detail, dict):
+                continue
+            if any(entry[0] == label for entry in detail.get("moves") or ()):
+                found.append(position)
+        return found
+
+    def _movements_for_action(self, group_index, position):
+        """What one action moved, as [label, start, end] in metres, or an empty list.
+
+        The recorded detail first, and the group snapshots as a fallback so a play
+        saved before actions carried coordinates can still be edited."""
+        if not (0 <= group_index < len(self.animation_steps)):
+            return []
+        details = self._action_details(self.animation_steps[group_index])
+        detail = details[position] if 0 <= position < len(details) else None
+        if not isinstance(detail, dict) or not detail.get("moves"):
+            detail = self._detail_from_snapshots(group_index, position)
+        if not isinstance(detail, dict):
+            return []
+        return [[label, list(start), list(end)]
+                for label, start, end in detail.get("moves") or ()]
+
+    def _group_position(self, index, label):
+        """Where one player stands at the end of a group, in metres, or None."""
+        if not (0 <= index < len(self.animation_steps)):
+            return None
+        for player in (self.animation_steps[index].get("board") or {}).get("players", []):
+            if player.get("label") == label:
+                return (player.get("mx"), player.get("my"))
+        return None
+
+    def _set_group_position(self, index, label, position):
+        """Put a player somewhere in a group's snapshot, clamped to the rink.
+
+        The snapshot is what playback and the exports read, so writing here is what
+        actually changes the play -- moving the token on the board would last only
+        until the next frame put it back."""
+        if position is None or not (0 <= index < len(self.animation_steps)):
+            return False
+        state = self._pitch_state()
+        mx = max(0.0, min(float(state["rink_len"]), float(position[0])))
+        my = max(0.0, min(float(state["rink_wid"]), float(position[1])))
+        for player in (self.animation_steps[index].get("board") or {}).get("players", []):
+            if player.get("label") == label:
+                player["mx"], player["my"] = mx, my
+                return True
+        return False
+
+    def _after_timeline_edit(self, index):
+        """Show what the timeline now says, without starting the animation.
+
+        An edit that only changed the numbers in the list would leave the board
+        showing the old positions, and there would be no way to tell whether it had
+        taken."""
+        self._refresh_animation_list()
+        if 0 <= index < len(self.animation_steps) and self.animation_job is None:
+            self._apply_animation_frame(self.animation_steps[max(index - 1, 0)],
+                                        self.animation_steps[index], 1.0)
+            self.animation_playhead = index
+            self.show_all_drawn_items()
+            self._refresh_animation_list()
+
+    def _keyframe_board(self, moved=None):
+        """The board as a new keyframe should record it.
+
+        Players that this action did not move keep the position the group before left
+        them at, rather than wherever they happen to be standing. That distinction
+        matters because Stop rewinds the board to the opening group and leaves it
+        there: carry on building from that board and a plain snapshot writes *every*
+        player back to their opening position, so the play gained a keyframe that sent
+        the whole team back to the start and then forward again. `moved` is the labels
+        this action actually moved; None means take the board as it stands."""
+        board = self._board_snapshot()
+        previous = self.animation_steps[-1].get("board") if self.animation_steps else None
+        if not previous or moved is None:
+            return board
+        was = {player.get("label"): player
+               for player in (previous.get("players") or []) if player.get("label")}
+        for player in board.get("players") or []:
+            label = player.get("label")
+            if label in was and label not in moved:
+                player["mx"], player["my"] = was[label]["mx"], was[label]["my"]
+        return board
+
+    @classmethod
+    def _action_seconds(cls, action):
+        """How long one action takes by default. Anything that only moves players --
+        a drag, or a whole formation -- is a cut and takes none."""
+        text = (action or "").strip().lower()
+        if not text or text.startswith("move ") or text == "move":
+            return cls.ACTION_SECONDS["move"]
+        first = text.split()[0].strip(":")
+        return cls.ACTION_SECONDS.get(first, cls.ACTION_SECONDS["move"])
+
+    def _default_duration(self, index):
+        """The time a group runs unless it has been given one by hand.
+
+        The longest of what is in it, so a group that draws a bend and a pass is timed
+        for reading them rather than for whichever happened to be recorded last."""
+        if index == 0:
+            return self.OPENING_SECONDS
+        if not (0 <= index < len(self.animation_steps)):
+            return 0.0
+        actions = self.animation_steps[index].get("actions") or []
+        return max((self._action_seconds(action) for action in actions), default=0.0)
+
+    def _retime_group(self, index):
+        """Bring a group's time back to the default for what it now contains, unless
+        it has been timed by hand."""
+        if not (0 <= index < len(self.animation_steps)):
+            return False
+        group = self.animation_steps[index]
+        if group.get("custom_duration"):
+            return False
+        group["duration"] = self._default_duration(index)
+        return True
+
+    def _capture_group_deltas(self):
+        """Each group as what it *moves*, keyed by the group itself.
+
+        A group snapshot holds where everyone ends up, which is fine until the groups
+        are put in a different order: the absolute positions travel with the rows, so
+        a player who went A to B to C ends up going A to C to B -- back and forth for
+        no reason. What a group means is the movement in it, so that is what gets
+        carried when one is moved."""
+        deltas = {}
+        for index, step in enumerate(self.animation_steps):
+            if index == 0:
+                continue
+            before = self._step_positions(self.animation_steps[index - 1])
+            after = self._step_positions(step)
+            deltas[id(step)] = {label: (after[label][0] - before[label][0],
+                                        after[label][1] - before[label][1])
+                                for label in after if label in before}
+        return deltas
+
+    def _apply_group_deltas(self, deltas):
+        """Rewrite every group's positions from the opening group plus the movements,
+        in whatever order the groups now stand."""
+        for index in range(1, len(self.animation_steps)):
+            moves = deltas.get(id(self.animation_steps[index])) or {}
+            for label, (dx, dy) in moves.items():
+                spot = self._group_position(index - 1, label)
+                if spot and spot[0] is not None:
+                    self._set_group_position(index, label,
+                                             (spot[0] + dx, spot[1] + dy))
+            # Anyone this group does not move stays where the group before left them.
+            previous = self._step_positions(self.animation_steps[index - 1])
+            for label, spot in previous.items():
+                if label not in moves:
+                    self._set_group_position(index, label, spot)
+        return True
 
     def _renumber_animation_steps(self):
         """Keep the automatic names in step with the order. A step named after the
@@ -2153,7 +3247,9 @@ class FloorballTacticsApp:
                 not (0 <= target < len(self.animation_steps)):
             return
         steps = self.animation_steps
+        deltas = self._capture_group_deltas()
         steps[index], steps[target] = steps[target], steps[index]
+        self._apply_group_deltas(deltas)
         self._renumber_animation_steps()
         self.animation_playhead = target
         # The order changed under it, so any playback in flight no longer means
@@ -2161,53 +3257,141 @@ class FloorballTacticsApp:
         self.stop_animation(rewind=False)
         self._refresh_animation_list()
 
+    def _drag_rows_for(self, item):
+        """Which rows a drag that starts on `item` carries.
+
+        Pressing on a row that is already part of a selection drags the whole
+        selection; pressing anywhere else drags just that row. Read before Tk gets the
+        click, because its own handling collapses a multiple selection down to the one
+        row that was pressed."""
+        selection = list(self.anim_tree.selection())
+        if item and item in selection and len(selection) > 1:
+            return selection, True
+        return ([item] if item else []), False
+
     def _anim_drag_start(self, event):
-        """A group row is dragged to reorder the sequence; one of the action rows
-        inside a group is dragged to move that action into another group."""
+        """Groups are dragged to reorder the sequence; the action rows inside a group
+        are dragged to move those actions into another group. Several of either can go
+        at once when they were selected together."""
         item = self.anim_tree.identify_row(event.y)
+        rows, keep_selection = self._drag_rows_for(item)
+        self._anim_drag_rows = rows
         self._anim_drag_index = self._group_index_for(item)
-        self._anim_drag_action = None
-        if item and "a" in item[1:]:
-            group_text, _, position = item[1:].partition("a")
-            try:
-                self._anim_drag_action = (int(group_text), int(position))
-            except ValueError:
-                self._anim_drag_action = None
-        return None
+        kinds = {self._row_parts(row)[1] for row in rows}
+        # A movement line is a read-out of where the players went and travels with its
+        # group, so a drag that includes one is a drag of groups.
+        self._anim_drag_action = "a" in kinds and kinds <= {"a"}
+        self._destroy_drag_ghost()
+        # "break" only when the selection must survive the press: letting Tk handle a
+        # plain click keeps ordinary clicking, Ctrl-clicking and Shift-clicking normal.
+        return "break" if keep_selection else None
 
     def _anim_drag_motion(self, event):
-        """Reordering happens live for groups. An action is only re-homed on release,
-        so it can be carried across the list without every row it passes claiming it."""
-        if getattr(self, "_anim_drag_action", None) is not None:
+        """Carry a grey copy of the rows under the cursor. Nothing is moved until the
+        button comes up, so a drag can be taken back by dropping it where it started
+        and the list does not reshuffle under the hand that is dragging it."""
+        if not getattr(self, "_anim_drag_rows", None):
             return None
-        source = getattr(self, "_anim_drag_index", None)
-        if source is None or not self.animation_steps:
-            return None
-        under = self._group_index_for(self.anim_tree.identify_row(event.y))
-        if under is None:
-            return None
-        target = max(0, min(under, len(self.animation_steps) - 1))
-        if target == source:
-            return None
-        step = self.animation_steps.pop(source)
-        self.animation_steps.insert(target, step)
-        self._anim_drag_index = target
-        self.animation_playhead = target
-        self._renumber_animation_steps()
-        self._refresh_animation_list()
-        return None
+        self._show_drag_ghost(event)
+        # Tk would otherwise read a drag as extending the selection, which fights the
+        # drag itself: the rows being carried would change on the way.
+        return "break"
+
+    def _show_drag_ghost(self, event):
+        """The small grey label that follows the cursor while dragging."""
+        rows = [row for row in getattr(self, "_anim_drag_rows", []) or []
+                if self.anim_tree.exists(row)]
+        if not rows:
+            return
+        caption = self.anim_tree.item(rows[0], "text").strip()
+        if len(rows) > 1:
+            caption = f"{caption}   +{len(rows) - 1} more"
+        ghost = getattr(self, "_drag_ghost", None)
+        if ghost is None or not ghost.winfo_exists():
+            ghost = tk.Toplevel(self.root)
+            ghost.overrideredirect(True)
+            ghost.attributes("-topmost", True)
+            try:
+                ghost.attributes("-alpha", 0.75)
+            except Exception:
+                pass          # a window manager that cannot fade it still shows it
+            self._drag_ghost_label = tk.Label(
+                ghost, text=caption, font=(self.UI_FONT, 8), bg="#adb5bd",
+                fg="#212529", bd=1, relief=tk.SOLID, padx=6, pady=2)
+            self._drag_ghost_label.pack()
+            self._drag_ghost = ghost
+        else:
+            self._drag_ghost_label.config(text=caption)
+        ghost.geometry(f"+{event.x_root + 12}+{event.y_root + 10}")
+        ghost.deiconify()
+
+    def _destroy_drag_ghost(self):
+        ghost = getattr(self, "_drag_ghost", None)
+        self._drag_ghost = None
+        self._drag_ghost_label = None
+        if ghost is not None:
+            try:
+                ghost.destroy()
+            except Exception:
+                pass
 
     def _anim_drag_end(self, event=None):
-        dragged_action = getattr(self, "_anim_drag_action", None)
-        if dragged_action is not None and event is not None:
-            target = self._group_index_for(self.anim_tree.identify_row(event.y))
-            self.move_action_to_group(dragged_action[0], dragged_action[1], target)
-        elif getattr(self, "_anim_drag_index", None) is not None:
-            self.stop_animation(rewind=False)
-            self._refresh_animation_list()
+        rows = getattr(self, "_anim_drag_rows", None) or []
+        self._destroy_drag_ghost()
+        target = (self._group_index_for(self.anim_tree.identify_row(event.y))
+                  if event is not None else None)
+        if rows and target is not None:
+            if getattr(self, "_anim_drag_action", False):
+                self._drop_actions(rows, target)
+            else:
+                self._drop_groups(rows, target)
+        self._anim_drag_rows = []
         self._anim_drag_index = None
-        self._anim_drag_action = None
+        self._anim_drag_action = False
         return None
+
+    def _drop_groups(self, rows, target):
+        """Put the dragged groups where they were dropped, in the order they were in."""
+        indices = sorted({self._row_parts(row)[0] for row in rows
+                          if self._row_parts(row)[0] is not None})
+        indices = [index for index in indices if 0 <= index < len(self.animation_steps)]
+        if not indices or not (0 <= target < len(self.animation_steps)):
+            return False
+        moving = [self.animation_steps[index] for index in indices]
+        landing = self.animation_steps[target]
+        if landing in moving:
+            return False
+        # By object rather than by index: pulling the groups out shifts every number
+        # after them, and the row that was dropped on is the one thing that has to
+        # stay meaningful through it.
+        deltas = self._capture_group_deltas()
+        for step in moving:
+            self.animation_steps.remove(step)
+        at = self.animation_steps.index(landing)
+        self.animation_steps[at:at] = moving
+        self._apply_group_deltas(deltas)
+        self.animation_playhead = at
+        self.stop_animation(rewind=False)
+        self._renumber_animation_steps()
+        self._refresh_animation_list()
+        return True
+
+    def _drop_actions(self, rows, target):
+        """Re-home the dragged actions into the group they were dropped on."""
+        wanted = []
+        for row in rows:
+            index, kind, position = self._row_parts(row)
+            if kind != "a" or index is None or position is None:
+                continue
+            actions = self.animation_steps[index].get("actions") or []
+            if 0 <= position < len(actions):
+                wanted.append((index, position))
+        # Back to front, so removing one does not shift the position of the next.
+        moved = False
+        for index, position in sorted(wanted, reverse=True):
+            moved = self.move_action_to_group(index, position, target) or moved
+        return moved
+
 
     def move_action_to_group(self, source_index, position, target_index):
         """Move one action out of its group and into the group it was dropped on."""
@@ -2221,9 +3405,12 @@ class FloorballTacticsApp:
         actions = source.get("actions") or []
         if not (0 <= position < len(actions)):
             return False
+        details = self._action_details(source)
+        detail = details.pop(position) if position < len(details) else None
         action = actions.pop(position)
         target = self.animation_steps[target_index]
         target.setdefault("actions", []).append(action)
+        self._set_action_detail(target, len(target["actions"]) - 1, detail)
         # Both ends get their heading rebuilt, unless they carry a name of their own --
         # dropping an action used to leave the group called after it.
         for index, group in ((source_index, source), (target_index, target)):
@@ -2249,43 +3436,186 @@ class FloorballTacticsApp:
         if tree is None:
             return
         # Remember which groups were folded, so a redraw does not spring them open.
+        # With the whole timeline folded by the button, groups made after that stay
+        # folded too, or the compact view would unpick itself as the play grew.
         collapsed = {index for index, item in enumerate(tree.get_children(""))
                      if not tree.item(item, "open")}
+        fold_all = getattr(self, "timeline_collapsed", False)
+        # And what was picked. The rows are thrown away and rebuilt on every change,
+        # so without this a selection lasted exactly until the next thing happened --
+        # which is no use at all when the selection is what says where a new arrow
+        # goes, and the act of drawing one is itself a change.
+        chosen = tree.selection()
         tree.delete(*tree.get_children(""))
         for index, group in enumerate(self.animation_steps):
             tags = ["group"]
-            if index == self.animation_playhead:
-                tags.append("playhead")     # the red row: playback starts here
+            # While it runs, the red row is the group being played -- the one being
+            # entered, not the one being left behind. Standing still, it is where
+            # playback would start from.
+            marked = (self._playing_group if self._playing_group is not None
+                      else self.animation_playhead)
+            if index == marked:
+                tags.append("playhead")
             node = tree.insert("", tk.END, iid=f"g{index}",
                                text=f"{index}  {group['name']}",
                                values=(f"{group['duration']:.1f}s",),
-                               open=index not in collapsed, tags=tuple(tags))
+                               open=not fold_all and index not in collapsed,
+                               tags=tuple(tags))
+            # Coordinates go on the action's own line -- never on a line of their own,
+            # which split one thing that happened across two rows and made a group
+            # look twice as busy as it is.
             for position, action in enumerate(group.get("actions") or []):
                 tree.insert(node, tk.END, iid=f"g{index}a{position}",
-                            text=f"   {action}", values=("",), tags=("action",))
+                            text=f"   {action}{self._detail_for_display(index, position)}",
+                            values=("",), tags=("action",))
+        # Put the selection back on whatever survived the rebuild.
+        still_there = [item for item in chosen if tree.exists(item)]
+        if still_there:
+            tree.selection_set(still_there)
+
+    @staticmethod
+    def _row_parts(item):
+        """What a timeline row id says: (group index, kind, position within the group).
+
+        Ids read `g3` for a group, `g3a1` for one of the actions in it, and `g3m2` for
+        one of the movements read off its snapshot. Splitting on the letter alone was
+        enough while actions were the only children; the movement rows mean the group
+        number has to be read off the front properly."""
+        if not item or not item.startswith("g"):
+            return (None, None, None)
+        rest = item[1:]
+        digits = ""
+        for character in rest:
+            if not character.isdigit():
+                break
+            digits += character
+        if not digits:
+            return (None, None, None)
+        rest = rest[len(digits):]
+        if not rest:
+            return (int(digits), "group", None)
+        try:
+            return (int(digits), rest[0], int(rest[1:]))
+        except ValueError:
+            return (int(digits), rest[0], None)
+
+    def _group_movements(self, index):
+        """Who moved into this group and where they went, in rink metres.
+
+        Metres rather than pixels: it is the same number whatever the window size, the
+        field or the zoom, and it is what the group snapshot itself holds."""
+        if not (0 < index < len(self.animation_steps)):
+            return []
+        before = self._step_positions(self.animation_steps[index - 1])
+        after = self._step_positions(self.animation_steps[index])
+        moves = []
+        for label, end in after.items():
+            start = before.get(label)
+            # Five centimetres: below that it is a player standing still, not a move.
+            if start and math.hypot(end[0] - start[0], end[1] - start[1]) >= 0.05:
+                moves.append((label, start, end))
+        moves.sort(key=lambda move: self._display_label(move[0]))
+        return moves
 
     def _group_index_for(self, item):
         """The group a tree row belongs to -- the row itself, or its parent when the
-        row is one of the actions inside a group."""
-        if not item:
-            return None
-        if not item.startswith("g"):
-            return None
-        parent = self.anim_tree.parent(item)
-        target = parent or item
-        try:
-            return int(target[1:].split("a")[0])
-        except ValueError:
-            return None
+        row is one of the lines inside a group."""
+        parent = self.anim_tree.parent(item) if item else None
+        return self._row_parts(parent or item)[0]
 
     def _on_anim_step_selected(self, _event=None):
         selection = self.anim_tree.selection()
         if not selection:
             return
         index = self._group_index_for(selection[0])
-        if index is not None and index != self.animation_playhead:
+        if index is None:
+            return
+        if index != self.animation_playhead:
             self.animation_playhead = index
             self._refresh_animation_list()
+        if getattr(self, "preview_var", None) is not None and self.preview_var.get():
+            self.preview_group(index)
+
+    def _on_timeline_double_click(self, event=None):
+        """A double-click edits whatever was under it: an action that moved players
+        opens its coordinates, and anything else opens the group's name and time."""
+        item = self.anim_tree.identify_row(event.y) if event else None
+        index, kind, position = self._row_parts(item)
+        if (kind == "a" and index is not None and position is not None
+                and self._movements_for_action(index, position)):
+            return self.edit_movement(index, position)
+        return self._rename_group(event)
+
+    def edit_movement(self, group_index, position):
+        """Type an action's movements in metres, rather than dragging a player across
+        the rink and hoping. One row per player the action moved."""
+        movements = self._movements_for_action(group_index, position)
+        if not movements:
+            return "break"
+        state = self._pitch_state()
+        actions = self.animation_steps[group_index].get("actions") or []
+        caption = actions[position] if position < len(actions) else "Movement"
+
+        window = tk.Toplevel(self.root)
+        window.title("Movement")
+        window.transient(self.root)
+        window.configure(bg=self.C_PANEL)
+        tk.Label(window, text=caption, bg=self.C_PANEL, fg=self.C_TEXT,
+                 font=(self.UI_FONT, 9, "bold")).grid(row=0, column=0, columnspan=5,
+                                                      padx=14, pady=(12, 2), sticky="w")
+        tk.Label(window, text=f"Metres, on a {state['rink_len']:g} × "
+                              f"{state['rink_wid']:g} m field.",
+                 bg=self.C_PANEL, fg=self.C_MUTED, font=(self.UI_FONT, 8)).grid(
+            row=1, column=0, columnspan=5, padx=14, sticky="w")
+        for column, heading in enumerate(("", "start x", "start y", "end x", "end y")):
+            tk.Label(window, text=heading, bg=self.C_PANEL, fg=self.C_MUTED,
+                     font=(self.UI_FONT, 8)).grid(row=2, column=column,
+                                                  padx=(14 if not column else 4, 4))
+
+        fields = []
+        for row, (label, start, end) in enumerate(movements, 3):
+            tk.Label(window, text=self._display_label(label), bg=self.C_PANEL,
+                     fg=self.C_TEXT, font=(self.UI_FONT, 9)).grid(
+                row=row, column=0, padx=(14, 4), pady=2, sticky="w")
+            boxes = []
+            for column, value in enumerate((start[0], start[1], end[0], end[1]), 1):
+                variable = tk.StringVar(value=f"{value:.2f}")
+                tk.Entry(window, textvariable=variable, width=7,
+                         font=(self.UI_FONT, 9), relief=tk.FLAT, highlightthickness=1,
+                         highlightbackground=self.C_BORDER, bg=self.C_SURFACE).grid(
+                    row=row, column=column, padx=4, pady=2)
+                boxes.append(variable)
+            fields.append((label, boxes))
+
+        def accept(_event=None):
+            edited = []
+            try:
+                for label, boxes in fields:
+                    numbers = [float(box.get()) for box in boxes]
+                    edited.append([label, numbers[:2], numbers[2:]])
+            except ValueError:
+                messagebox.showwarning("Not a number",
+                                       "Positions are in metres, like 12.5.")
+                return
+            window.destroy()
+            self.push_command(EditMovementCommand(self, group_index, position, edited),
+                              execute=True)
+
+        buttons = tk.Frame(window, bg=self.C_PANEL)
+        buttons.grid(row=len(movements) + 3, column=0, columnspan=5, padx=14, pady=12,
+                     sticky="e")
+        cfg = {"font": (self.UI_FONT, 8), "relief": tk.FLAT, "bg": self.C_BTN,
+               "fg": self.C_TEXT, "bd": 0, "highlightthickness": 1,
+               "highlightbackground": self.C_BORDER, "padx": 10, "pady": 3,
+               "cursor": "hand2"}
+        tk.Button(buttons, text="Apply", command=accept, **cfg).pack(side=tk.RIGHT, padx=3)
+        tk.Button(buttons, text="Cancel", command=window.destroy,
+                  **cfg).pack(side=tk.RIGHT)
+        window.bind("<Return>", accept)
+        window.bind("<Escape>", lambda _e: window.destroy())
+        self._make_modal(window)
+        return window
+
 
     def _rename_group(self, event=None):
         """Double-click a group to give it a name of your own."""
@@ -2352,17 +3682,71 @@ class FloorballTacticsApp:
             return False
         try:
             self.animation_steps[index]["duration"] = max(0.0, min(15.0, float(seconds)))
+            # Set by hand, so the defaults leave it alone from here on.
+            self.animation_steps[index]["custom_duration"] = True
         except Exception:
             return False
         self._refresh_animation_list()
         return True
 
+    # What the time dial is aimed at. A group can answer to more than one of these --
+    # "Move B + Pass" is both a movement and an action -- and it is retimed if any box
+    # that matches it is ticked.
+    TIME_TARGETS = ("All", "Actions", "Moves", "Shots", "Start")
+
+    def _group_time_kinds(self, index):
+        """Which of the time dial's boxes a group answers to."""
+        if not (0 <= index < len(self.animation_steps)):
+            return set()
+        kinds = {"All"}
+        if index == 0:
+            kinds.add("Start")
+        actions = self.animation_steps[index].get("actions") or []
+        if not actions:
+            kinds.add("Moves")
+        for action in actions:
+            seconds = self._action_seconds(action)
+            if seconds == self.ACTION_SECONDS["move"]:
+                kinds.add("Moves")
+            elif seconds == self.ACTION_SECONDS["shot"]:
+                kinds.add("Shots")
+            else:
+                kinds.add("Actions")
+        return kinds
+
+    def _group_takes_slider(self, index):
+        """Whether the time dial retimes this group."""
+        wanted = {name for name, variable in
+                  (getattr(self, "time_target_vars", None) or {}).items()
+                  if variable.get()}
+        if not wanted:
+            return False
+        if "All" in wanted:
+            return True
+        return bool(wanted & self._group_time_kinds(index))
+
+    def _on_time_target_changed(self, name):
+        """All and the four kinds are alternatives: picking one drops the other."""
+        variables = getattr(self, "time_target_vars", None) or {}
+        if name == "All" and variables["All"].get():
+            for other, variable in variables.items():
+                if other != "All":
+                    variable.set(False)
+        elif name != "All" and variables[name].get():
+            variables["All"].set(False)
+        return True
+
     def _on_step_time_changed(self, _value=None):
-        """The slider is the time for all steps: moving it retimes the whole sequence.
-        A single step can still be given its own interval by double-clicking it."""
+        """The time dial retimes the groups the boxes beside it are aimed at -- every
+        group, or only the ones that shoot, or move players, or draw something, or the
+        opening still. A single group can still be given its own interval by
+        double-clicking it."""
         duration = max(0.0, float(self.step_time_var.get()))
-        for step in self.animation_steps:
+        for index, step in enumerate(self.animation_steps):
+            if not self._group_takes_slider(index):
+                continue
             step["duration"] = duration
+            step["custom_duration"] = True
         self._refresh_animation_list()
 
     def _edit_step_time(self, _event=None):
@@ -2416,13 +3800,19 @@ class FloorballTacticsApp:
         """Put every player where it should be a `fraction` of the way between two
         keyframes, and bring in the drawings that belong to the group being entered.
         Positions are in rink metres, so this is correct at any window size and in
-        either rink orientation."""
+        either rink orientation.
+
+        The players move; the marks do not. An arrow is drawn once, as its own group
+        opens, and then stays exactly where it was drawn -- it is a note about what is
+        meant to happen, not a thing being carried around the rink. Playback used to
+        drag arrows along behind the players they were snapped to, which made a pass
+        arrow move a second time as the ball ran down it and left it longer than it
+        had been drawn. Snapping still ties an arrow to a player while the board is
+        being built: a Shift-drag brings it along."""
         try:
             to_index = self.animation_steps.index(to_step)
         except ValueError:
             to_index = None
-        if getattr(self, "_attached_origins", None) is None:
-            self._attached_origins = self._capture_attached_origins()
         start = self._step_positions(from_step)
         end = self._step_positions(to_step)
         for label, (sx, sy) in start.items():
@@ -2447,91 +3837,8 @@ class FloorballTacticsApp:
                 except Exception:
                     pass
 
-        # Where every player finishes this group, so an arrow that is still being drawn
-        # can be laid out at its final length rather than sliding along behind them.
-        finals = {}
-        for label, (ex, ey) in end.items():
-            sid = self._get_sid_by_label(label)
-            if sid is not None:
-                finals[sid] = self._rink_to_px(ex, ey)
-
-        # The players have moved; the arrows snapped to them follow, and only then are
-        # the drawings brought in -- the reveal reads the geometry the tracking has
-        # just brought up to date.
-        self._track_attached_lines(to_index, finals)
         if to_index is not None:
             self._apply_drawn_for_frame(to_index, fraction)
-
-    def _capture_attached_origins(self):
-        """Where every arrow snapped to a player sits before playback moves anything.
-
-        Each frame is then worked out from the player's *total* travel since this
-        moment. Nudging the arrow by one frame's delta instead would fight the reveal,
-        which puts a drawing back to its recorded geometry on every frame, and the tip
-        would fall further behind the player the longer the group ran."""
-        origins = {}
-        seen = set()
-        for token in self.tokens.values():
-            if not isinstance(token, dict):
-                continue
-            sid = token.get("shape_id")
-            if sid is None or sid in seen:
-                continue
-            seen.add(sid)
-            box = self.canvas.bbox(sid)
-            if not box:
-                continue
-            centre = ((box[0] + box[2]) / 2.0, (box[1] + box[3]) / 2.0)
-            for at_end, key in ((False, "attached_lines_start"),
-                                (True, "attached_lines_end")):
-                for cid in token.get(key) or ():
-                    coords = self.canvas.coords(cid)
-                    if coords and len(coords) >= 4:
-                        origins.setdefault(cid, []).append(
-                            (sid, centre, at_end, list(coords)))
-        return origins
-
-    def _track_attached_lines(self, to_index=None, finals=None):
-        """Keep every attached arrow pointing at its player.
-
-        An arrow snapped to a player is aimed *at them*, so it has to stay aimed while
-        they run: on the board a plain drag deliberately lets go of the arrow -- that
-        is repositioning, not choreography -- but in the animation the tip must not be
-        left behind.
-
-        An arrow that is being drawn *in this group* is a different case. It is laid
-        out at the geometry it will finish with, so it grows from its final tail
-        position along its final path. Tracking it live instead made the whole arrow
-        slide across the rink as it grew, because both ends were moving at once."""
-        finals = finals or {}
-        for cid, entries in (getattr(self, "_attached_origins", None) or {}).items():
-            meta = self.drawn_items.get(cid)
-            if meta is None:
-                continue
-            being_drawn = to_index is not None and meta.get("anim_group") == to_index
-            for sid, centre, at_end, coords in entries:
-                token = self.tokens.get(sid)
-                box = self.canvas.bbox(sid) if token else None
-                if being_drawn and sid in finals:
-                    target = finals[sid]
-                elif box:
-                    target = ((box[0] + box[2]) / 2.0, (box[1] + box[3]) / 2.0)
-                else:
-                    continue
-                dx = target[0] - centre[0]
-                dy = target[1] - centre[1]
-                axis = self._drawing_axis(cid, centre)
-                if not axis:
-                    continue
-                moved = self._stretched_points(coords, axis[0], axis[1], dx, dy)
-                if moved is None:
-                    continue
-                try:
-                    self.canvas.coords(cid, *moved)
-                except Exception:
-                    continue
-                if meta.get("full_coords"):
-                    meta["full_coords"] = list(moved)
 
     def _apply_drawn_for_frame(self, to_index, fraction):
         """Arrows, boxes, signs and labels take part in the animation: anything drawn in
@@ -2593,27 +3900,18 @@ class FloorballTacticsApp:
             if len(current) != len(full) or current != full:
                 self.canvas.coords(cid, *full)
 
-    def _reveal_drawn_item(self, cid, meta, fraction):
-        """A line is drawn on from its start; anything else appears as its group opens."""
-        if fraction <= 0:
-            self.canvas.itemconfig(cid, state=tk.HIDDEN)
-            return
-        self.canvas.itemconfig(cid, state=tk.NORMAL)
-        full = meta.get("full_coords")
-        if not full or self.canvas.type(cid) != "line" or len(full) < 4:
-            return
-        if fraction >= 1.0:
-            self.canvas.coords(cid, *full)
-            return
-        # Walk the line's own length and stop where the fraction falls, so a curve
-        # follows its curve rather than its chord.
+    def _partial_line(self, cid, full, fraction):
+        """The first `fraction` of a line's own length, as a list of points.
+
+        Walked along the line rather than across its chord, so a curve follows its
+        curve."""
         points = [(full[i], full[i + 1]) for i in range(0, len(full) - 1, 2)]
         points = self._curve_points(cid, points)
         spans = [math.hypot(b[0] - a[0], b[1] - a[1])
                  for a, b in zip(points, points[1:])]
         total = sum(spans)
         if total <= 0:
-            return
+            return None
         wanted = total * fraction
         drawn = [points[0]]
         for (a, b), span in zip(zip(points, points[1:]), spans):
@@ -2624,7 +3922,60 @@ class FloorballTacticsApp:
             share = wanted / span if span else 0
             drawn.append((a[0] + (b[0] - a[0]) * share, a[1] + (b[1] - a[1]) * share))
             break
-        if len(drawn) >= 2:
+        return drawn
+
+    def _reveal_lead(self, cid, fraction):
+        """How far along the arrow this piece belongs to has been drawn, and where that
+        arrow finishes -- the two points an arrowhead has to be moved between."""
+        best, span = None, -1.0
+        for other in self._drawn_siblings(cid):
+            if other == cid or self.canvas.type(other) != "line":
+                continue
+            full = (self.drawn_items.get(other) or {}).get("full_coords")
+            if not full or len(full) < 4:
+                continue
+            length = math.hypot(full[-2] - full[0], full[-1] - full[1])
+            if length > span:
+                best, span = (other, list(full)), length
+        if not best:
+            return None
+        other, full = best
+        drawn = self._partial_line(other, full, fraction)
+        if not drawn:
+            return None
+        return drawn[-1], (full[-2], full[-1])
+
+    def _reveal_drawn_item(self, cid, meta, fraction):
+        """A line is drawn on from its start, and the arrowhead rides the point it has
+        reached.
+
+        The head used to be put on the board whole the instant its group opened, so a
+        shot appeared as a head hanging at the far end with its shaft creeping out to
+        meet it. It leads the arrow instead: the head goes first and the tail builds up
+        behind it, which is the way the arrow was drawn in the first place."""
+        if fraction <= 0:
+            self.canvas.itemconfig(cid, state=tk.HIDDEN)
+            return
+        self.canvas.itemconfig(cid, state=tk.NORMAL)
+        full = meta.get("full_coords")
+        if not full or len(full) < 4:
+            return
+        if self.canvas.type(cid) != "line":
+            # An arrowhead, or any other piece that cannot be drawn on part-way: carry
+            # it to wherever its shaft has got to.
+            lead = self._reveal_lead(cid, fraction)
+            if not lead:
+                return
+            (lx, ly), (ex, ey) = lead
+            dx, dy = lx - ex, ly - ey
+            self.canvas.coords(cid, *[value + (dx if index % 2 == 0 else dy)
+                                      for index, value in enumerate(full)])
+            return
+        if fraction >= 1.0:
+            self.canvas.coords(cid, *full)
+            return
+        drawn = self._partial_line(cid, full, fraction)
+        if drawn and len(drawn) >= 2:
             self.canvas.coords(cid, *[value for point in drawn for value in point])
 
     def _curve_points(self, cid, points):
@@ -2654,9 +4005,6 @@ class FloorballTacticsApp:
     def show_all_drawn_items(self):
         """Put every drawing back on the board at full length -- what the rink looks
         like when the animation is not running."""
-        # The board is at rest, so the next run captures where the arrows are then,
-        # not where they were before this one.
-        self._attached_origins = None
         for cid, meta in list(self.drawn_items.items()):
             try:
                 self.canvas.itemconfig(cid, state=tk.NORMAL)
@@ -2672,6 +4020,8 @@ class FloorballTacticsApp:
         if self.animation_playing:
             return
         self.animation_playing = True
+        self.log_event("PLAY", f"from group {self.animation_playhead} "
+                               f"of {len(self.animation_steps)}")
         # Resume from the playhead: whatever red row is showing is where it starts.
         # Sitting on the final step -- where Add Step leaves it -- means there is
         # nothing after it to move to, so that rewinds to the opening slide instead of
@@ -2692,16 +4042,20 @@ class FloorballTacticsApp:
             return
         step = self.animation_steps[index + 1]
         duration = float(step.get("duration", 1.0))
+        pause = self.STEP_BREAK_SECONDS if self._break_between_steps() else 0.0
         # A group set to zero seconds is a cut: jump straight to it.
         fraction = 1.0 if duration <= 0 else min(1.0, elapsed / duration)
         self._apply_animation_frame(self.animation_steps[index], step, fraction)
         self.animation_playhead = index if fraction < 1.0 else index + 1
+        self._playing_group = index + 1
         self._refresh_animation_list()
 
-        if fraction >= 1.0:
+        step_on = elapsed + 1.0 / self.ANIMATION_FPS
+        if fraction >= 1.0 and step_on >= duration + pause:
             self._animation_cursor = (index + 1, 0.0)
         else:
-            self._animation_cursor = (index, elapsed + 1.0 / self.ANIMATION_FPS)
+            # Still inside the group, or holding the finished frame for the break.
+            self._animation_cursor = (index, step_on)
         self.animation_job = self.root.after(int(1000 / self.ANIMATION_FPS),
                                              self._animation_tick)
 
@@ -2716,12 +4070,25 @@ class FloorballTacticsApp:
             self.animation_job = None
 
     def stop_animation(self, rewind=True):
-        """Stop and go back to the opening slide."""
+        """Stop, and put the play back to rest.
+
+        The playhead goes to the opening group, so Play starts from the beginning
+        again -- but the *board* is left showing the end of the play, which is what it
+        shows before anything is ever played and what carries on being edited.
+
+        It used to leave the board rewound to the opening group as well. Nothing
+        needed that -- playback sets every position from the snapshots on its first
+        frame -- and it quietly broke the next thing you did: the board said everyone
+        was back at the start, so dragging a player and adding a group recorded them
+        from there, and the play gained a keyframe that sent the team back to the
+        opening arrangement and then forward again. That is players going back and
+        forth during the animation for no reason anybody could see."""
+        self.log_event("STOP", f"rewind={rewind}")
         self.pause_animation()
         self._animation_cursor = None
+        self._playing_group = None
         if rewind and self.animation_steps:
-            self._apply_animation_frame(self.animation_steps[0],
-                                        self.animation_steps[0], 0.0)
+            self.show_play_end()
             self.animation_playhead = 0
         # Last, not first: the rewind frame above hides anything belonging to a later
         # group, and a stopped board is a static board with everything on it.
@@ -2828,6 +4195,7 @@ class FloorballTacticsApp:
 
     def run_export(self, fmt="GIF", groups=None):
         """Write the export. Split from the dialog so it can be driven directly."""
+        self.log_event("EXPORT", f"{fmt}, groups={groups if groups is not None else 'all'}")
         if fmt in self.IMAGE_FORMATS:
             # Not `groups or [0]`: an empty list is a caller saying "none", which is a
             # thing to refuse rather than quietly turn into group 0.
@@ -2852,17 +4220,21 @@ class FloorballTacticsApp:
         self.pause_animation()
         restore = self._board_snapshot()
         try:
-            frames = self._render_animation_frames()
+            rendered = self._render_animation_frames()
+            frames, holds = rendered if rendered else (None, None)
             if frames is None:
                 return False
             if not frames:
                 messagebox.showwarning("Nothing to export", "No frames were produced.")
                 return False
             if fmt == "GIF":
+                # optimize=False, or the encoder merges frames that repeat and the
+                # times below stop meaning anything.
                 frames[0].save(path, save_all=True, append_images=frames[1:],
-                               duration=int(1000 / self.ANIMATION_FPS), loop=0,
-                               optimize=True)
-            elif not self._write_video(path, frames, self.VIDEO_FORMATS[fmt][1]):
+                               duration=[int(round(hold)) for hold in holds],
+                               loop=0, optimize=False)
+            elif not self._write_video(path, self._frames_for_video(frames, holds),
+                                       self.VIDEO_FORMATS[fmt][1]):
                 return False
             messagebox.showinfo(
                 "Exported",
@@ -2879,11 +4251,21 @@ class FloorballTacticsApp:
             self.canvas.update()
 
     def _render_animation_frames(self):
-        """Walk the board through the whole sequence, capturing every frame.
+        """Walk the board through the whole sequence, capturing every frame, and say
+        how long each one is on screen for.
+
+        A break is a frame held longer, not the same frame captured several times
+        over. Repeating it does not survive the GIF encoder -- it drops frames that
+        are identical to the one before -- so the break went missing from every export
+        whether the box was ticked or not, and the timing of the frames it merged came
+        out wrong into the bargain.
 
         None means the board could not be captured at all, which is a different thing
         from a sequence that produced no frames."""
-        frames = []
+        frames, holds = [], []
+        each = 1000.0 / self.ANIMATION_FPS
+        pause = (self.STEP_BREAK_SECONDS * 1000.0
+                 if self._break_between_steps() else 0.0)
         for index in range(len(self.animation_steps) - 1):
             step = self.animation_steps[index + 1]
             count = max(1, int(round(float(step.get("duration", 1.0))
@@ -2900,7 +4282,77 @@ class FloorballTacticsApp:
                         "installed (the 'gs' command).")
                     return None
                 frames.append(captured)
-        return frames
+                # The last frame of a group is the one held for the break.
+                holds.append(each + (pause if frame == count - 1 else 0.0))
+        return frames, holds
+
+    def _frames_for_video(self, frames, holds):
+        """A video runs at a fixed rate, so a frame that is held becomes several."""
+        each = 1000.0 / self.ANIMATION_FPS
+        out = []
+        for frame, hold in zip(frames, holds):
+            out.extend([frame] * max(1, int(round(hold / each))))
+        return out
+
+    @classmethod
+    def video_backends(cls):
+        """Which video writers this machine actually has, by name."""
+        found = {}
+        for name, module in cls.VIDEO_BACKENDS.items():
+            try:
+                importlib.import_module(module)
+                found[name] = True
+            except Exception:
+                found[name] = False
+        return found
+
+    def _pip_install(self, packages):
+        """Install packages into the interpreter the application is running under.
+
+        `sys.executable`, not a bare `pip`: a machine can easily have several Pythons,
+        and installing into the wrong one looks exactly like the install not working."""
+        command = [sys.executable, "-m", "pip", "install", *packages]
+        self.log_event("INSTALL", " ".join(command))
+        try:
+            done = subprocess.run(command, capture_output=True, text=True, timeout=900)
+        except Exception as error:
+            return False, f"{type(error).__name__}: {error}"
+        output = ((done.stdout or "") + (done.stderr or "")).strip()
+        self.log_event("INSTALL", f"exit {done.returncode}")
+        return done.returncode == 0, output[-1200:]
+
+    def offer_video_libraries(self):
+        """No video writer installed: offer to fetch one rather than only saying so.
+
+        True means a writer is available now -- either it already was, or it has just
+        been installed."""
+        if any(self.video_backends().values()):
+            return True
+        if not messagebox.askyesno(
+                "No video writer",
+                "Writing a video needs imageio or OpenCV, and this Python has "
+                "neither.\n\n"
+                f"Install {' and '.join(self.VIDEO_PACKAGES)} now?\n\n"
+                f"It goes into:\n{sys.executable}\n\n"
+                "It downloads tens of megabytes and takes a minute or two, and the "
+                "window will not respond while it runs.\n\n"
+                "GIF, PNG and JPEG export work without any of it."):
+            return False
+        installed, detail = self._pip_install(self.VIDEO_PACKAGES)
+        # importlib caches what it failed to find, so a fresh install is invisible
+        # until the caches are told to look again.
+        importlib.invalidate_caches()
+        if installed and any(self.video_backends().values()):
+            messagebox.showinfo("Installed",
+                                "The video writer is in place. Exporting again now.")
+            return True
+        messagebox.showerror(
+            "Could not install",
+            "The install did not finish, so video export is still unavailable.\n\n"
+            f"Try it yourself with:\n"
+            f"    {sys.executable} -m pip install {' '.join(self.VIDEO_PACKAGES)}\n\n"
+            f"{detail}")
+        return False
 
     def _write_video(self, path, frames, codec):
         """Frames to a video file, through whichever writer this machine has.
@@ -2909,6 +4361,8 @@ class FloorballTacticsApp:
         OpenCV, which ships its own FFmpeg on most installs. Neither is a dependency
         of the application: without them the GIF and the stills still work."""
         size = (frames[0].width, frames[0].height)
+        if not any(self.video_backends().values()) and not self.offer_video_libraries():
+            return False
         try:
             import imageio.v2 as imageio            # noqa: PLC0415
         except Exception:
@@ -2926,10 +4380,8 @@ class FloorballTacticsApp:
         except Exception:
             messagebox.showerror(
                 "Export failed",
-                "Writing a video needs either imageio or OpenCV.\n\n"
-                "Install one of them:\n"
-                "    pip install imageio imageio-ffmpeg\n"
-                "    pip install opencv-python\n\n"
+                "Neither video writer would load, even though one is installed.\n\n"
+                f"This is running under:\n{sys.executable}\n\n"
                 "GIF, PNG and JPEG export work without either.")
             return False
         writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*codec),
@@ -3104,17 +4556,14 @@ class FloorballTacticsApp:
                     "comes back -- it only makes the record easier to read."):
                 commands = tidied
             board = self._board_snapshot()
-            # A watermark entry embeds the whole image, so only the last one is kept --
-            # the earlier ones are superseded anyway -- and the board's copy is dropped
-            # when a command already carries it. Otherwise a couple of edits would
-            # write the same few hundred kB into the file three or four times over.
-            watermark_at = [i for i, entry in enumerate(commands)
-                            if entry.get("type") == "watermark"]
-            if watermark_at:
-                keep = watermark_at[-1]
-                commands = [entry for i, entry in enumerate(commands)
-                            if entry.get("type") != "watermark" or i == keep]
-                board.pop("watermark", None)
+            # The board keeps the watermark; the command log does not. A version 3 file
+            # is loaded from the board and nothing in it is ever replayed, so moving
+            # the image into the log -- which is what used to happen -- meant the
+            # watermark was written to the file and then never came back from it. The
+            # log keeps the entries as history, without the few hundred kB of image.
+            commands = [dict(entry, watermark=None)
+                        if entry.get("type") == "watermark" else entry
+                        for entry in commands]
             # Version 3 is the play itself, not a recipe for re-enacting it: where
             # every mark sits in rink metres, the whole timeline with each group's
             # duration and the second it starts at, and the board each group ends on.
@@ -3135,6 +4584,9 @@ class FloorballTacticsApp:
             }
             with open(filepath, "w") as f:
                 json.dump(data, f, indent=4)
+            self.log_event("SAVE", f"{os.path.basename(filepath)}: "
+                                   f"{len(commands)} commands, "
+                                   f"{len(self.animation_steps)} groups")
             messagebox.showinfo("Success", "Macro saved successfully!")
 
     def load_macro(self):
@@ -3235,6 +4687,11 @@ class FloorballTacticsApp:
         self.show_all_drawn_items()
         self._refresh_animation_list()
         self._update_indicators()
+        self._report_damaged_marks()
+        self.log_event("LOAD", f"{len(self.animation_steps)} groups, "
+                               f"{len(self.drawn_items)} drawings, "
+                               f"{len({t.get('shape_id') for t in self.tokens.values()})}"
+                               f" players")
         return True
 
     # ----------------------
@@ -3394,6 +4851,14 @@ class FloorballTacticsApp:
         menu_menu.add_separator()
         menu_menu.add_command(label="Preferences...", command=self.open_preferences)
         menubar.add_cascade(label="Menu", menu=menu_menu)
+
+        help_menu = tk.Menu(menubar, tearoff=0)
+        help_menu.add_command(label="Report a Bug...", command=self.report_bug)
+        help_menu.add_command(label="Debug Log...", command=self.show_debug_log)
+        help_menu.add_checkbutton(
+            label="Debug Mode", variable=self.debug_mode_var,
+            command=lambda: self.set_debug_mode(self.debug_mode_var.get()))
+        menubar.add_cascade(label="Help", menu=help_menu)
 
         file_menu = tk.Menu(menubar, tearoff=0)
         file_menu.add_command(label="Save Macro...", command=self.save_macro)
@@ -3770,7 +5235,9 @@ class FloorballTacticsApp:
 
         self.anim_tree = ttk.Treeview(anim_column, style="Timeline.Treeview",
                                       columns=("time",), show="tree", height=8,
-                                      selectmode="browse")
+                                      # Several rows at once: Ctrl to pick them one by
+                                      # one, Shift to take everything between two.
+                                      selectmode="extended")
         # Narrow by request, wide by expansion: the timeline takes whatever the two
         # rows of boxes leave over, so asking for less here keeps Tactics intact.
         self.anim_tree.column("#0", width=120, minwidth=90, stretch=True)
@@ -3780,11 +5247,17 @@ class FloorballTacticsApp:
                                      foreground="#ffffff")
         self.anim_tree.tag_configure("action", foreground=self.C_MUTED)
         self.anim_tree.pack(fill=tk.BOTH, expand=True, pady=(1, 2))
+        # The coordinates sit on the action's own line, which makes some lines longer
+        # than a narrow panel: they are reachable rather than lost off the edge.
+        self.anim_scroll = ttk.Scrollbar(anim_column, orient="horizontal",
+                                         command=self.anim_tree.xview)
+        self.anim_scroll.pack(fill=tk.X)
+        self.anim_tree.configure(xscrollcommand=self.anim_scroll.set)
         # The old action log lives on off-screen: commands still record and un-record
         # their lines through it, and those lines are what name the groups above.
         self.steps_listbox = tk.Listbox(t_sub)
         self.anim_tree.bind("<<TreeviewSelect>>", self._on_anim_step_selected)
-        self.anim_tree.bind("<Double-Button-1>", self._rename_group)
+        self.anim_tree.bind("<Double-Button-1>", self._on_timeline_double_click)
         # Drag and drop to reorder.
         self.anim_tree.bind("<ButtonPress-1>", self._anim_drag_start)
         self.anim_tree.bind("<B1-Motion>", self._anim_drag_motion)
@@ -3801,6 +5274,42 @@ class FloorballTacticsApp:
                                         font=(self.UI_FONT, 7), showvalue=True, length=90,
                                         command=self._on_step_time_changed)
         self.step_time_scale.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(3, 0))
+        # On their own row: the timeline column is the narrowest thing in the toolbar,
+        # and hanging these off the end of the slider pushed Tactics below its size.
+        toggle_row = tk.Frame(anim_column, bg=self.C_PANEL)
+        toggle_row.pack(fill=tk.X)
+        self.preview_var = tk.BooleanVar(value=False)
+        self.preview_check = tk.Checkbutton(
+            toggle_row, text="Show", variable=self.preview_var,
+            command=self.toggle_group_preview, bg=self.C_PANEL, fg=self.C_TEXT,
+            selectcolor=self.C_SURFACE, activebackground=self.C_PANEL,
+            activeforeground=self.C_TEXT, font=(self.UI_FONT, 7),
+            highlightthickness=0, bd=0)
+        self.preview_check.pack(side=tk.LEFT)
+        self.step_break_var = tk.BooleanVar(value=False)
+        self.step_break_check = tk.Checkbutton(
+            toggle_row, text="Break", variable=self.step_break_var,
+            bg=self.C_PANEL, fg=self.C_TEXT, selectcolor=self.C_SURFACE,
+            activebackground=self.C_PANEL, activeforeground=self.C_TEXT,
+            font=(self.UI_FONT, 7), highlightthickness=0, bd=0)
+        self.step_break_check.pack(side=tk.LEFT, padx=(0, 2))
+
+        # What the time dial above is aimed at.
+        target_row = tk.Frame(anim_column, bg=self.C_PANEL)
+        target_row.pack(fill=tk.X)
+        self.time_target_vars = {}
+        self.time_target_checks = {}
+        for name in self.TIME_TARGETS:
+            variable = tk.BooleanVar(value=(name == "All"))
+            self.time_target_vars[name] = variable
+            check = tk.Checkbutton(
+                target_row, text=name, variable=variable,
+                command=lambda n=name: self._on_time_target_changed(n),
+                bg=self.C_PANEL, fg=self.C_TEXT, selectcolor=self.C_SURFACE,
+                activebackground=self.C_PANEL, activeforeground=self.C_TEXT,
+                font=(self.UI_FONT, 7), highlightthickness=0, bd=0, padx=0)
+            check.pack(side=tk.LEFT)
+            self.time_target_checks[name] = check
 
         # The slider retimes every step at once; this field is the selected step's own
         # interval, so a single step can be lengthened without hunting for the
@@ -3819,6 +5328,7 @@ class FloorballTacticsApp:
                 ("Stop", self.stop_animation),
                 ("Add Group", self.add_animation_step),
                 ("Delete", self.delete_animation_selection),
+                ("Collapse", self.toggle_timeline_detail),
                 ("Up", lambda: self.move_animation_step(-1)),
                 ("Down", lambda: self.move_animation_step(1)))):
             button = tk.Button(anim_buttons, text=label, command=command, **transport_cfg)
@@ -3836,14 +5346,17 @@ class FloorballTacticsApp:
         g_grid.pack(fill=tk.BOTH, expand=True)
         general_btn_cfg = {k: v for k, v in gray_btn_cfg.items() if k != "width"}
 
-        tk.Button(g_grid, text="Undo", command=self.undo, **general_btn_cfg).grid(row=0, column=0, padx=3, pady=2, sticky="ew")
-        tk.Button(g_grid, text="Redo", command=self.redo, **general_btn_cfg).grid(row=0, column=1, padx=3, pady=2, sticky="ew")
-        tk.Button(g_grid, text="Save", command=self.save_macro, **general_btn_cfg).grid(row=0, column=2, padx=3, pady=2, sticky="ew")
-        tk.Button(g_grid, text="Export", command=self.export_animation, **general_btn_cfg).grid(row=0, column=3, padx=3, pady=2, sticky="ew")
-        tk.Button(g_grid, text="Load", command=self.load_macro, **general_btn_cfg).grid(row=1, column=0, padx=3, pady=2, sticky="ew")
-        tk.Button(g_grid, text="Watermark", command=self.add_watermark, **general_btn_cfg).grid(row=1, column=1, padx=3, pady=2, sticky="ew")
-        tk.Button(g_grid, text="Reset", command=self.reset_board, **general_btn_cfg).grid(row=1, column=2, padx=3, pady=2, sticky="ew")
-        tk.Button(g_grid, text="Prefs", command=self.open_preferences, **general_btn_cfg).grid(row=1, column=3, padx=3, pady=2, sticky="ew")
+        # The files across the top, the editing underneath.
+        for row, group in enumerate((
+                (("Load", self.load_macro), ("Save", self.save_macro),
+                 ("Export", self.export_animation), ("Reset", self.reset_board)),
+                (("Undo", self.undo), ("Redo", self.redo),
+                 ("Prefs", self.open_preferences),
+                 ("Watermark", self.add_watermark)))):
+            for column, (label, command) in enumerate(group):
+                tk.Button(g_grid, text=label, command=command,
+                          **general_btn_cfg).grid(row=row, column=column,
+                                                  padx=3, pady=2, sticky="ew")
         for col in range(4):
             g_grid.columnconfigure(col, weight=1, uniform="general")
 
@@ -3896,6 +5409,18 @@ class FloorballTacticsApp:
         "Reset": "Clear the board back to the starting formations, with no drawings, "
                  "watermark, timeline or animation steps. Asks first.",
         # Animation transport
+        "All": "The time dial retimes every group.",
+        "Actions": "The time dial retimes only the groups that draw something.",
+        "Moves": "The time dial retimes only the groups that move players or the ball.",
+        "Shots": "The time dial retimes only the groups with a shot in them.",
+        "Start": "The time dial retimes only the opening group.",
+        "Break": "Hold each group for a moment when it finishes, so a play can be "
+                 "read back a group at a time. Applies to the export as well.",
+        "Show": "Follow the timeline with the board: picking a group shows how the "
+                "rink stands once that group has finished.",
+        "Collapse": "Fold every group shut for a compact view of the whole play, and "
+                    "open them all again.",
+        "Expand": "Open every group again, so each one lists what happens inside it.",
         "Add Group": "Close the current group and start the next one. Everything in a "
                      "group happens at the same time when the animation plays.",
         "Play": "Play the animation from the red group.",
@@ -3943,7 +5468,7 @@ class FloorballTacticsApp:
         "Pass": "Draw a pass: a straight arrow.",
         "Shot": "Draw a shot.",
         "Dribble": "Draw a dribble: a wavy run with the ball.",
-        "Run": "Draw a run without the ball.",
+        "Run": "Draw a Run",
         "Line": "Draw a plain straight line.",
         "Bend": "Draw a curve: click the start, the bend, then the end. It takes the "
                 "line type that is armed, so a pass, shot, dribble or run can be bent.",
@@ -4535,6 +6060,8 @@ class FloorballTacticsApp:
             "def_color": self.def_color,
             "line_color": self.line_color,
             "sign_color": self.sign_color,
+            "debug_mode": self.debug_mode,
+            "bug_report_email": self.bug_report_email,
         }
 
     def _restore_settings(self, snapshot):
@@ -4549,6 +6076,12 @@ class FloorballTacticsApp:
                                ("grid", self.grid_var),
                                ("ghosting", self.ghosting_var)):
             variable.set(snapshot[name])
+        # The debug checkbox takes effect as it is ticked, so Cancel has to put it
+        # back like the rest of them.
+        if snapshot.get("debug_mode") != self.debug_mode:
+            self.set_debug_mode(snapshot.get("debug_mode", False))
+        self.bug_report_email = snapshot.get("bug_report_email",
+                                             self.bug_report_email)
         if snapshot["color_theme"] != self.color_theme:
             self.apply_color_theme(snapshot["color_theme"])
         # The individual pickers may have moved a colour without changing the theme.
@@ -4658,10 +6191,26 @@ class FloorballTacticsApp:
                 row=row, column=0, sticky="w", padx=18, pady=2)
             row += 1
 
+        row = heading("Bug reports and debugging", row)
+        tk.Label(win, text="Send to:").grid(row=row, column=0, sticky="w",
+                                            padx=18, pady=2)
+        email_var = tk.StringVar(value=self.bug_report_email)
+        tk.Entry(win, textvariable=email_var, width=26).grid(
+            row=row, column=1, sticky="w", padx=10, pady=2)
+        row += 1
+        tk.Checkbutton(win, text="Debug mode (show errors instead of swallowing them)",
+                       variable=self.debug_mode_var, anchor="w",
+                       command=lambda: self.set_debug_mode(self.debug_mode_var.get())
+                       ).grid(row=row, column=0, columnspan=2, sticky="w", padx=18)
+        row += 1
+
         btns = tk.Frame(win)
         btns.grid(row=row, column=0, columnspan=2, pady=10)
 
         def apply_and_close():
+            address = email_var.get().strip()
+            if address:
+                self.bug_report_email = address
             self.set_menu_rows_mode(rows_var.get())
             self.set_menu_position(position_var.get())
             self.toggle_grid_visuals()
@@ -5156,24 +6705,30 @@ class FloorballTacticsApp:
         while its far end stays put."""
         if not isinstance(token, dict):
             return
-        # Where the player is now: the end of an arrow nearest to that is the end that
-        # is attached to them.
+        # Where the player stood *before* this move: the end of an arrow nearest to
+        # that is the end attached to them. Measured from where they have landed
+        # instead, a drag longer than the arrow puts the far end nearer the player than
+        # the attached one, so the wrong end was picked and the whole arrow leapt
+        # forward instead of stretching. The caller has already moved the token, so the
+        # delta is taken back off here.
         near = self._token_centre_px(token)
         if not near:
             return
+        near = (near[0] - dx, near[1] - dy)
         for key in ("attached_lines_start", "attached_lines_end"):
             ids = token.get(key)
             if not ids:
                 continue
             live = []
             for cid in list(ids):
-                if self._stretch_attached_end(cid, dx, dy, near):
+                if self._stretch_attached_end(cid, dx, dy, near,
+                                              key == "attached_lines_end"):
                     live.append(cid)
             # Ids of arrows that have since been deleted are dropped rather than
             # carried forever.
             token[key] = live
 
-    def _stretch_attached_end(self, cid, dx, dy, near):
+    def _stretch_attached_end(self, cid, dx, dy, near, at_end=None):
         """Move one drawing's attached end. False if the item is no longer there."""
         try:
             coords = list(self.canvas.coords(cid))
@@ -5181,7 +6736,7 @@ class FloorballTacticsApp:
             return False
         if len(coords) < 4:
             return bool(coords)
-        axis = self._drawing_axis(cid, near)
+        axis = self._drawing_axis(cid, near, at_end)
         if not axis:
             return True
         moved = self._stretched_points(coords, axis[0], axis[1], dx, dy)
@@ -5190,7 +6745,7 @@ class FloorballTacticsApp:
         self.canvas.coords(cid, *moved)
         return True
 
-    def _drawing_axis(self, cid, near):
+    def _drawing_axis(self, cid, near, at_end=None):
         """The line an arrow runs along, and which end of it is the attached one.
 
         Measured from the drawing as it stands, not from the record the tool drew it
@@ -5198,8 +6753,13 @@ class FloorballTacticsApp:
         resize, a change of field or a zoom moves the arrow without touching it -- so
         the weighting was computed against a line that was no longer there, every
         point came out at the same weight, and the whole arrow jumped along with the
-        player instead of stretching from its far end. Which end is attached is
-        decided by which end is nearer the player, which needs no record at all."""
+        player instead of stretching from its far end. Which end is attached is told
+        by the caller where it knows -- it is the list the drawing was filed under --
+        and otherwise taken to be whichever end is nearer the player.
+
+        `near` must be where the player stands while the arrow still ends on them:
+        before a drag, or before playback starts. Asked once the player has run past
+        the far end of their own arrow, the nearest end is the wrong one."""
         best, span = None, -1.0
         for other in self._drawn_siblings(cid):
             try:
@@ -5215,10 +6775,14 @@ class FloorballTacticsApp:
         if not best:
             return None
         start, end = best
-        to_start = math.hypot(start[0] - near[0], start[1] - near[1])
-        to_end = math.hypot(end[0] - near[0], end[1] - near[1])
+        if at_end is None:
+            # No record of which end: the nearer one to the player is it, which is the
+            # same answer whenever the drawing still ends where it was drawn.
+            to_start = math.hypot(start[0] - near[0], start[1] - near[1])
+            to_end = math.hypot(end[0] - near[0], end[1] - near[1])
+            at_end = to_start > to_end
         # anchor stays put, head follows the player.
-        return (end, start) if to_start <= to_end else (start, end)
+        return (start, end) if at_end else (end, start)
 
     def _stretched_points(self, coords, anchor, head, dx, dy):
         """One drawing's points with its attached end moved by (dx, dy).
